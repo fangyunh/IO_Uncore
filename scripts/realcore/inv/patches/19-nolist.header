@@ -1,0 +1,6 @@
+# inv-patch: 19-nolist
+# purpose: outstanding_tr oracle — IO qpairs no longer track in-flight trackers on the outstanding_tr list (submit inserts and complete_tracker removes only for the admin queue, the Mode D completion loop drops its TAILQ_REMOVE), to bound the cost of the list maintenance
+# safety: UNSAFE
+# breaks: abort, timeout and teardown of in-flight IO on IO qpairs (both modes); on IO qpairs the list is always empty so nvme_pcie_qpair_abort_trackers (abort and qpair disable/destroy), nvme_pcie_qpair_check_timeout (timeout_cb_fn), nvme_pcie_qpair_process_completions bad-vtophys failure walk and nvme_pcie_qpair_mark_doorbell_time (non-lean build only) iterate nothing, so in-flight IOs are never aborted or timed out and a qpair torn down with IO in flight leaks them; admin queue (AER abort, admin timeouts) is unchanged; nvme_pcie.c:1224 (nvme_pcie_qpair_iterate_requests) likewise sees nothing on IO qpairs; queue_depth is still maintained; a tracker marked bad_vtophys on an IO qpair is never failed (the has_pending_vtophys_failures walk sees an empty list), so that IO would be stranded (cannot happen in a normal run)
+# env: none
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff,12-residue.diff,13-iport.diff

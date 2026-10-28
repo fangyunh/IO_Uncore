@@ -1,0 +1,6 @@
+# inv-patch: 13-iport
+# purpose: I-port — Mode D host path without port defects; the only defect found in the residue audit (class A, hot in Mode 4) is the per-IO 32-bit integer divide in the Mode D submit branch, sq_desc_tail=(idx+1) % num_entries, replaced by a compare-and-wrap; every other class-A row is design semantics and is kept (outstanding_tr bookkeeping, abort and teardown stay)
+# safety: SAFE
+# breaks: none
+# env: none
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff,12-residue.diff

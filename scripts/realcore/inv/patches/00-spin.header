@@ -1,0 +1,6 @@
+# inv-patch: 00-spin
+# purpose: calibrated serialized busy loop per IO for the CPU-bound host-slope test (spec §4 H)
+# safety: SAFE
+# breaks: none
+# env: SPDK_INV_SPIN_NS=<ns> (TSC-timed busy-wait, the spec §4 H instrument) or SPDK_INV_SPIN_CYCLES=<iterations> (lfence-serialized add loop, diagnostic); default 0 = off
+# base: none

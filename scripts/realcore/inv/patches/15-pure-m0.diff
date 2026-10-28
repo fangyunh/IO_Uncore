@@ -1,0 +1,86 @@
+# inv-patch: 15-pure-m0
+# purpose: B-stock-pure: vanilla Mode 0 reference (Mode D dispatch compiled out); Mode 4 does NOT work in this variant
+# safety: SAFE
+# breaks: Mode D/C/E unusable
+# env: none
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff,12-residue.diff,13-iport.diff,14-stathist.diff
+diff -ruN a/lib/nvme/nvme_pcie_common.c b/lib/nvme/nvme_pcie_common.c
+--- a/lib/nvme/nvme_pcie_common.c	2026-10-14 04:03:46.313015069 +0000
++++ b/lib/nvme/nvme_pcie_common.c	2026-10-14 04:04:00.496681754 +0000
+@@ -1313,17 +1313,7 @@
+ 	}
+ 
+ 	if (pqpair->flags.delay_cmd_submit) {
+-		if (pqpair->sq_desc_ring != NULL) {
+-			/* IO-Uncore v4.1 (Mode D): batch on the descriptor-ring cursor.
+-			 * ring_sq_doorbell publishes sq_desc_tail (not sq_tail).  Per-IO
+-			 * t_doorbell is already stamped at submit, so mark_doorbell_time
+-			 * is a no-op here — the batched doorbell is not attributed per IO. */
+-			if (pqpair->last_sq_desc_tail != pqpair->sq_desc_tail) {
+-				nvme_pcie_qpair_ring_sq_doorbell(qpair);
+-				nvme_pcie_qpair_mark_doorbell_time(pqpair, nvme_io_cycle_rdtsc());
+-				pqpair->last_sq_desc_tail = pqpair->sq_desc_tail;
+-			}
+-		} else if (pqpair->last_sq_tail != pqpair->sq_tail) {
++		if (pqpair->last_sq_tail != pqpair->sq_tail) {
+ 			nvme_pcie_qpair_ring_sq_doorbell(qpair);
+ 			nvme_pcie_qpair_mark_doorbell_time(pqpair, nvme_io_cycle_rdtsc());
+ 			pqpair->last_sq_tail = pqpair->sq_tail;
+diff -ruN a/lib/nvme/nvme_pcie_internal.h b/lib/nvme/nvme_pcie_internal.h
+--- a/lib/nvme/nvme_pcie_internal.h	2026-10-14 04:03:46.303657978 +0000
++++ b/lib/nvme/nvme_pcie_internal.h	2026-10-14 04:04:00.495991662 +0000
+@@ -170,12 +170,8 @@
+ static inline int
+ uncore_mode_c(void)
+ {
+-	static int g_uncore_mode_c = -1;
+-	if (g_uncore_mode_c < 0) {
+-		const char *e = getenv("SPDK_UNCORE_MODE_C");
+-		g_uncore_mode_c = (e != NULL && e[0] == '1') ? 1 : 0;
+-	}
+-	return g_uncore_mode_c;
++	/* B-stock-pure: Mode C/D/E compiled out (constant false). */
++	return 0;
+ }
+ 
+ /* IO-Uncore v4.1 (Mode D): completion-callback ring.  A strict superset of the
+@@ -190,12 +186,8 @@
+ static inline int
+ uncore_mode_d(void)
+ {
+-	static int g_uncore_mode_d = -1;
+-	if (g_uncore_mode_d < 0) {
+-		const char *e = getenv("SPDK_UNCORE_MODE_D");
+-		g_uncore_mode_d = (e != NULL && e[0] == '1') ? 1 : 0;
+-	}
+-	return g_uncore_mode_d;
++	/* B-stock-pure: Mode C/D/E compiled out (constant false). */
++	return 0;
+ }
+ 
+ /* IO-Uncore v4.2 (Mode E): device-owned tracker-slot free ring.  A strict
+@@ -212,12 +204,8 @@
+ static inline int
+ uncore_mode_e(void)
+ {
+-	static int g_uncore_mode_e = -1;
+-	if (g_uncore_mode_e < 0) {
+-		const char *e = getenv("SPDK_UNCORE_MODE_E");
+-		g_uncore_mode_e = (e != NULL && e[0] == '1') ? 1 : 0;
+-	}
+-	return g_uncore_mode_e;
++	/* B-stock-pure: Mode C/D/E compiled out (constant false). */
++	return 0;
+ }
+ 
+ /* IO-Uncore v3 (Mode C) 24-byte host->device SQ descriptor (little-endian,
+@@ -479,8 +467,7 @@
+ 	 * the classic NVMe SQ tail (the device fetches SQEs from the host-DRAM
+ 	 * descriptor ring).  Same sq_tdbl register, different value.  In every
+ 	 * non-Mode-C path sq_desc_ring is NULL and this is exactly sq_tail. */
+-	uint32_t db_val = (pqpair->sq_desc_ring != NULL) ?
+-			  pqpair->sq_desc_tail : pqpair->sq_tail;
++	uint32_t db_val = pqpair->sq_tail;
+ 
+ 	if (qpair->last_fuse == SPDK_NVME_IO_FLAGS_FUSE_FIRST) {
+ 		/* This is first cmd of two fused commands - don't ring doorbell */

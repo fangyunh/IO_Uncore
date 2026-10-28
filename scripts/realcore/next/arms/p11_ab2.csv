@@ -1,0 +1,4 @@
+arm_id,variant,tgt_variant,mode,env,trace
+S2w_p10a,nx-p10a,,0,SPDK_IAU_S2=1;SPDK_PERF_WORKER_GROUP=1,none
+S2w_p11a,nx-p11a,,0,SPDK_IAU_S2=1;SPDK_PERF_WORKER_GROUP=1,none
+S2wWB_p11a,nx-p11a,,0,SPDK_IAU_S2=1;SPDK_IAU_S2_WB=1;SPDK_PERF_WORKER_GROUP=1,none

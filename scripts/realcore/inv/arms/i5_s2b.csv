@@ -1,0 +1,4 @@
+arm_id,variant,tgt_variant,mode,env,trace
+l1-m4,inv-gring,,4,SPDK_INV_TRFREE=1,
+gring-m4,inv-gring,,4,SPDK_INV_TRFREE=1;IAU_INV_GLOBAL_RING=1,
+gring2-m4,inv-gring,,4,SPDK_INV_TRFREE=1;IAU_INV_GLOBAL_RING=2,

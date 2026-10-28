@@ -1,0 +1,6 @@
+# inv-patch: 26-l7-app
+# purpose: L7 harness overhead (spec C8, J, H10): with SPDK_INV_TRACE_FAST=1 the trace replay in perf.c reads a per-ns_ctx table of exactly g_trace_count precomputed (offset_in_ios << 1 | is_read) values and wraps the cursor with a compare-and-reset, instead of a 64-bit modulo by g_trace_count, a 64-bit division by g_io_size_bytes and a conditional modulo by size_in_ios on every IO (no 64-bit division per IO); the flag is parsed once in main(), the table is built on the first IO of each ns_ctx inside the fast branch only (one stderr line "INV_TRACE_FAST entries=N" per ns_ctx), and with the env unset the stock per-IO path gains one load and one not-taken branch in front of the unchanged trace-replay lines
+# safety: SAFE
+# breaks: none for the replayed sequence (identical to stock); the table build (~tens of ms) runs on each worker's first IO, so runs must use --warmup-time
+# env: SPDK_INV_TRACE_FAST=1 (default off)
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff,12-residue.diff,13-iport.diff,20-l1-trfree.diff,22-l2-thin.diff

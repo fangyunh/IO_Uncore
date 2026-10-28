@@ -1,0 +1,5 @@
+cell_id,app_cpus,dev_cpus,qd,qpairs,controllers,compute,lat,placement,env
+A,0,4+5,128,2,1,0,1,same-socket,IAU_DEV_CHANNELS=64
+B,0,4+5,256,2,1,0,1,same-socket,IAU_DEV_CHANNELS=64
+q16p1,0,4,16,1,1,0,1,same-socket,IAU_DEV_CHANNELS=64
+q32p2,0,4+5,32,2,1,0,1,same-socket,IAU_DEV_CHANNELS=64

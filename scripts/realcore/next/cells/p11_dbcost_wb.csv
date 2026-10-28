@@ -1,0 +1,2 @@
+cell_id,app_cpus,dev_cpus,qd,qpairs,controllers,compute,lat,placement,env,workload,rwmix,io_size,engine_cpus
+bigg5x8,0,2+3+4+5,176,1,8,0,1,same-socket,IAU_DEV_MODEL=ctrlr;IAU_DEV_CHANNELS=8;IAU_DEV_TMAX=308750;IAU_DEV_LMIN_NS=50000,randread,100,4096,6+7

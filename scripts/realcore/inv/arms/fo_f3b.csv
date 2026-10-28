@@ -1,0 +1,5 @@
+arm_id,variant,tgt_variant,mode,env,trace
+pre-m0,inv-fo-f2,,0,IAU_CQ_BATCH_N=8,
+m0,lean,,0,IAU_CQ_BATCH_N=8,
+trk-m4,lean,,4,SPDK_MD_TRACKERS=1;IAU_CQ_BATCH_N=8,
+trf-m4,lean,,4,IAU_CQ_BATCH_N=8,

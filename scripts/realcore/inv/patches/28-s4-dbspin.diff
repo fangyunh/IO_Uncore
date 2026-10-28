@@ -1,0 +1,188 @@
+# inv-patch: 28-s4-dbspin
+# purpose: S4 emulated MMIO doorbell cost (spec I5 S4, J, H14): the vfio-user shared-memory doorbell store costs the app core far less than a posted PCIe MMIO write (published 125-250 ns), so this overlay adds k ns of work after every doorbell store (SQ and CQ, in both modes; Mode D publishes sq_desc_tail through the same nvme_pcie_qpair_ring_sq_doorbell) so a run at k in {125, 250} can be compared with the analytic correction doorbells/IO x k (a spin cannot overlap with other work, so it is the upper bound). Two knobs, both off by default and both read once at load by inv_env_prime(): SPDK_INV_DB_SPIN_NS=<ns> is the PRIMARY calibrated instrument, a TSC-timed busy-wait (t0 = spdk_get_ticks(); while (spdk_get_ticks() - t0 < ticks);, ticks = ns x spdk_get_ticks_hz() / 1e9 computed once at the first IO qpair construct, minimum 1) with no fence, so the core keeps its cross-IO memory-level parallelism; SPDK_INV_DB_SPIN_CYCLES=<n> is the plan's lfence-serialized add loop (lfence, n x add, lfence; ~1.35 cycles per iteration), kept as the serialized upper bound because the serialization itself also kills cross-IO overlap (~25-35 ns/IO extra at QD128, the I0/I1 lesson). When both are set the ns wait runs first, then the cycle loop. Enable bit: a new second hot byte inv_db (offset 111, the other byte of the 2-byte hole after flags, locked by a static assert; qpair stays at 112) holds INV_DB_ON on IO qpairs when either knob is positive; it is deliberately NOT an inv_flags bit, because any inv_flags bit diverts the poll to the lever loops, which have no stock fallback. The doorbell helpers test it once per doorbell store (one byte compare + one branch per doorbell, inside need_mmio; one inlined poll site compiles to a taken branch when off) and call the noinline inv_db_spin_slow() in nvme_pcie_common.c, which counts the spun stores in a tail counter inv_db_n. With both knobs unset nothing else changes: no inv_flags bit, no poll or submit change. Composes with every other lever (the destroy check uses 25's inv_pool_state). Set at the end of IO qpair construct.
+# safety: SAFE (adds delay only; no queue, record or ring state changes)
+# breaks: none (a TSC wait inside the poll and submit paths inflates per-IO time by design, so raw IOPS and any rdtsc-based stage probes of a spun run are not comparable with an unspun one); the ns spin assumes the TSC is invariant and its resolution is two spdk_get_ticks() calls (a few ns); the ns knob under-injects if the core is descheduled only in the sense of wall clock, not CPU time; the cycles knob is the serialized upper bound, not a calibrated cost; admin qpair (qid 0) never spins. §4 L evidence (printed only when a knob is positive): host "INV_DBSPIN qid=N ns=K cycles=C" per IO qpair at construct and, at destroy, "INV_DBSPIN qid=N all K cids returned at destroy (doorbells=D)" only when that qpair's cid pool is whole (the 23/25 rule: thin stack, else trfree stack, else every tracker back on free_tr with outstanding_tr empty), else an ERROR line with "lost IO"; doorbells=D counts the doorbell stores that spun (SQ and CQ), the number to multiply by k for the analytic correction
+# env: SPDK_INV_DB_SPIN_NS=<ns> (default 0, calibrated TSC wait per doorbell), SPDK_INV_DB_SPIN_CYCLES=<iterations> (default 0, lfence-serialized add loop per doorbell)
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff,12-residue.diff,13-iport.diff,20-l1-trfree.diff,22-l2-thin.diff,23-l3-rec.diff,24-l4-idleflush.diff,25-l6-desc.diff,26-l7-app.diff,27-l9-addr.diff
+diff -ruN a/lib/nvme/nvme_pcie_common.c b/lib/nvme/nvme_pcie_common.c
+--- a/lib/nvme/nvme_pcie_common.c	2026-10-14 01:57:10.119398703 +0000
++++ b/lib/nvme/nvme_pcie_common.c	2026-10-14 01:57:17.712596133 +0000
+@@ -115,6 +115,34 @@
+ 	return g_inv_rec_env_set == 1;
+ }
+ 
++static int64_t g_inv_db_spin_ns = -1;	/* SPDK_INV_DB_SPIN_NS (strtoll); default 0 */
++static int64_t g_inv_db_spin_cycles = -1;	/* SPDK_INV_DB_SPIN_CYCLES (strtoll); default 0 */
++static uint64_t g_inv_db_ticks;	/* TSC ticks per spin (ns knob), set at construct; 0 = no ns spin */
++
++/* inv 28-s4: the out-of-line doorbell spin, entered only when pqpair->inv_db != 0. First the
++ * TSC-timed wait for SPDK_INV_DB_SPIN_NS (no fence), then the lfence-serialized add loop for
++ * SPDK_INV_DB_SPIN_CYCLES (the serialized upper bound; ~1.35 cycles per iteration). */
++void __attribute__((noinline))
++inv_db_spin_slow(struct nvme_pcie_qpair *pqpair)
++{
++	uint64_t i, x = 0;
++
++	pqpair->inv_db_n++;
++	if (g_inv_db_ticks != 0) {
++		uint64_t t0 = spdk_get_ticks();
++
++		while (spdk_get_ticks() - t0 < g_inv_db_ticks) {
++		}
++	}
++	if (g_inv_db_spin_cycles > 0) {
++		__asm__ volatile("lfence" ::: "memory");
++		for (i = 0; i < (uint64_t)g_inv_db_spin_cycles; i++) {
++			__asm__ volatile("add $1, %0" : "+r"(x));
++		}
++		__asm__ volatile("lfence" ::: "memory");
++	}
++}
++
+ /* inv: read every lever env once at load time, on the main thread, so no worker thread
+  * fills a cache lazily; qpair construct then turns the values into inv_flags bits. */
+ static void __attribute__((constructor))
+@@ -127,6 +155,8 @@
+ 	inv_env_i64("IAU_INV_DESC_BYTES", &g_inv_desc_bytes, 40);
+ 	(void)inv_desc_env_set();
+ 	(void)inv_addr_mode();
++	inv_env_i64("SPDK_INV_DB_SPIN_NS", &g_inv_db_spin_ns, 0);
++	inv_env_i64("SPDK_INV_DB_SPIN_CYCLES", &g_inv_db_spin_cycles, 0);
+ }
+ 
+ SPDK_STATIC_ASSERT(sizeof(struct nvme_uncore_cq_cb_rec) == 32, "LOCKED Mode D record is 32 B");
+@@ -706,6 +736,29 @@
+ 			pqpair->inv_addr_b == 1 ? "va" : "vtophys");
+ 	}
+ 
++	/* inv 28-s4-dbspin: the doorbell spin is on for IO qpairs when either knob is positive.
++	 * It has its own byte (inv_db), not an inv_flags bit, so it never diverts the poll or
++	 * submit paths. Set last; the destroy line balances the cid pool whatever else is on. */
++	pqpair->inv_db = 0;
++	pqpair->inv_db_n = 0;
++	if (qpair->id != 0) {
++		int64_t ns = inv_env_i64("SPDK_INV_DB_SPIN_NS", &g_inv_db_spin_ns, 0);
++		int64_t cyc = inv_env_i64("SPDK_INV_DB_SPIN_CYCLES", &g_inv_db_spin_cycles, 0);
++
++		if (ns > 0 || cyc > 0) {
++			if (ns > 0) {
++				/* ticks = ns * tsc_hz / 1e9, computed here (env is up), same value on every qpair. */
++				g_inv_db_ticks = (uint64_t)(((__uint128_t)ns * spdk_get_ticks_hz()) / 1000000000ull);
++				if (g_inv_db_ticks == 0) {
++					g_inv_db_ticks = 1;
++				}
++			}
++			pqpair->inv_db = INV_DB_ON;
++			fprintf(stderr, "INV_DBSPIN qid=%u ns=%" PRId64 " cycles=%" PRId64 "\n",
++				qpair->id, ns > 0 ? ns : 0, cyc > 0 ? cyc : 0);
++		}
++	}
++
+ 	nvme_pcie_qpair_reset(qpair);
+ 
+ 	return 0;
+@@ -2104,6 +2157,23 @@
+ 					  whole ? "empty" : "not empty", extra, m);
+ 		}
+ 	}
++	if (pqpair->inv_db != 0) {
++		/* inv 28-s4-dbspin: the §4 L evidence. The spin only delays doorbells, so the cid
++		 * pool must be whole at destroy (the same rule as 23/25); doorbells = stores that spun. */
++		uint32_t cap, avail;
++		uint64_t extra;
++		bool whole = inv_pool_state(pqpair, &cap, &avail, &extra);
++
++		if (whole && avail == cap && extra == 0) {
++			fprintf(stderr, "INV_DBSPIN qid=%u all %u cids returned at destroy (doorbells=%" PRIu64 ")\n",
++				qpair->id, cap, pqpair->inv_db_n);
++		} else {
++			NVME_QPAIR_ERRLOG(qpair, "INV_DBSPIN qid=%u at destroy: %u of %u cids free, "
++					  "outstanding list %s (lost IO), %" PRIu64 " extra cids "
++					  "(doorbells=%" PRIu64 ")\n", qpair->id, avail, cap,
++					  whole ? "empty" : "not empty", extra, pqpair->inv_db_n);
++		}
++	}
+ 	if (pqpair->tr) {
+ 		spdk_free(pqpair->tr);
+ 	}
+diff -ruN a/lib/nvme/nvme_pcie_internal.h b/lib/nvme/nvme_pcie_internal.h
+--- a/lib/nvme/nvme_pcie_internal.h	2026-10-14 01:57:10.120000278 +0000
++++ b/lib/nvme/nvme_pcie_internal.h	2026-10-14 01:57:17.716807419 +0000
+@@ -421,6 +421,10 @@
+ 	} flags;
+ 
+ 	uint8_t inv_flags;	/* inv lever bits (INV_F_*), set at construct; 0 = stock */
++	/* inv 28-s4: doorbell-spin enable (INV_DB_ON), the second byte of the hole. Kept out of
++	 * inv_flags so that bit alone never diverts the poll or submit paths to the lever
++	 * functions; only the doorbell helpers read it. */
++	uint8_t inv_db;
+ 
+ 	/*
+ 	 * Base qpair structure.
+@@ -497,6 +501,7 @@
+ 	uint8_t inv_desc_b;		/* inv 25: Mode D descriptor bytes (32|40|64), IO qpairs of Mode D */
+ 	uint8_t inv_desc_logged;	/* inv 25: bytes in this qpair's INV_DESC line; 0 = none */
+ 	uint8_t inv_addr_b;		/* inv 27: 1 = w2 is the data va, 2 = w2 is vtophys(va); 0 = off */
++	uint64_t inv_db_n;		/* inv 28: doorbell stores that spun (SQ and CQ) */
+ };
+ 
+ /* inv 22-l2-thin: one read with no nvme_request and no tracker (UNSAFE oracle, see the patch
+@@ -507,6 +512,7 @@
+ #ifdef SPDK_NVME_IO_CYCLE_OFF
+ /* inv: lever state must not move a stock field (lean layout: flags at 109, qpair at 112). */
+ SPDK_STATIC_ASSERT(offsetof(struct nvme_pcie_qpair, inv_flags) == 110, "inv_flags left the hole");
++SPDK_STATIC_ASSERT(offsetof(struct nvme_pcie_qpair, inv_db) == 111, "inv_db left the hole");
+ SPDK_STATIC_ASSERT(offsetof(struct nvme_pcie_qpair, qpair) == 112, "inv: stock hot layout moved");
+ #endif
+ 
+@@ -553,6 +559,34 @@
+ 	return true;
+ }
+ 
++/*
++ * inv 28-s4-dbspin: emulated MMIO doorbell cost (spec I5 S4). A real posted doorbell write costs
++ * the issuing core roughly 125-250 ns that the vfio-user shared-memory doorbell does not. Two
++ * knobs, both off by default, both read once at load (inv_env_prime) and turned into the
++ * per-qpair INV_DB_ON byte at IO qpair construct:
++ *   SPDK_INV_DB_SPIN_NS=<ns>      PRIMARY, the calibrated "k ns per doorbell" instrument: a
++ *                                 TSC-timed busy-wait after each doorbell store, no fence, so
++ *                                 the core's memory-level parallelism across IOs is untouched.
++ *   SPDK_INV_DB_SPIN_CYCLES=<n>   an lfence-serialized add loop (~1.35 cycles/iteration). It
++ *                                 also kills cross-IO overlap (~25-35 ns/IO extra at QD128), so
++ *                                 it is the serialized UPPER bound, not a calibrated cost.
++ * The spin runs after the doorbell store, inside need_mmio, for the SQ doorbell (Mode D
++ * publishes sq_desc_tail through the same helper) and the CQ doorbell, in both modes. With both
++ * knobs unset INV_DB_ON stays 0: the cost is one byte load + one not-taken branch per doorbell.
++ * The spin body is out of line in nvme_pcie_common.c.
++ */
++#define INV_DB_ON	0x01u
++
++void inv_db_spin_slow(struct nvme_pcie_qpair *pqpair);
++
++static inline void
++inv_db_spin(struct nvme_pcie_qpair *pqpair)
++{
++	if (spdk_unlikely(pqpair->inv_db != 0)) {
++		inv_db_spin_slow(pqpair);
++	}
++}
++
+ static inline void
+ nvme_pcie_qpair_ring_sq_doorbell(struct spdk_nvme_qpair *qpair)
+ {
+@@ -588,6 +622,7 @@
+ 		g_thread_mmio_ctrlr = pctrlr;
+ 		spdk_mmio_write_4(pqpair->sq_tdbl, db_val);
+ 		g_thread_mmio_ctrlr = NULL;
++		inv_db_spin(pqpair);
+ #ifndef SPDK_NVME_IO_CYCLE_OFF
+ 		pqpair->last_sq_db_ts = nvme_io_cycle_rdtsc();
+ #endif
+@@ -614,6 +649,7 @@
+ 		g_thread_mmio_ctrlr = pctrlr;
+ 		spdk_mmio_write_4(pqpair->cq_hdbl, pqpair->cq_head);
+ 		g_thread_mmio_ctrlr = NULL;
++		inv_db_spin(pqpair);
+ 	}
+ }
+ 

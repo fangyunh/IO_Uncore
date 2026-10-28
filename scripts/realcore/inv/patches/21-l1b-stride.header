@@ -1,0 +1,6 @@
+# inv-patch: 21-l1b-stride
+# purpose: break the 4 KiB tracker stride that maps every tracker header to one L1 set (H5): NVME_MAX_PRP_LIST_ENTRIES 503 -> 511 makes struct nvme_tracker 4160 B (header 72 B + 511*8 B), and the tracker array is allocated 4096-aligned
+# safety: SAFE for 4 KiB IO (UNSAFE for multi-page IO)
+# breaks: a multi-page PRP list may cross a 4 KiB page (the PRP list lives inside the tracker at offset 72, tracker i starts at 4160*i), and the max transfer size from nvme_pcie_ctrlr_get_max_xfer_size grows from 503 to 511 pages; 4 KiB randread uses a single PRP entry and no list, so it is unaffected; a tracker may also straddle a 2 MiB hugepage boundary in IOVA space (irrelevant for 4 KiB IO)
+# env: none (compile-time)
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff,12-residue.diff,13-iport.diff

@@ -1,0 +1,1 @@
+# inv-noop: no patches; checks that an overlay tree seeded from lean builds and runs.

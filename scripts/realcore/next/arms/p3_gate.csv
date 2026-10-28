@@ -1,0 +1,6 @@
+arm_id,variant,tgt_variant,mode,env,trace
+S1p1,nx-p1c,,0,,
+S1,nx-p3a,,0,,
+I1p1,nx-p1c,,4,,
+I1,nx-p3a,,4,,
+I1e,nx-p3a,,5,,

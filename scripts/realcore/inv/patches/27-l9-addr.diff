@@ -1,0 +1,223 @@
+# inv-patch: 27-l9-addr
+# purpose: L9 oracle, the data-address cost of D1 (spec I4 L9, H17): the Mode D descriptor word w2 (the tracker cookie, ignored by the device) carries the request's data address, so the host-side price of handing the device an address is measured while the target ignores the field. SPDK_INV_ADDR=va writes the raw virtual address of the payload (contig_or_cb_arg + payload_offset: the shared-virtual-addressing bound, one add and one store), SPDK_INV_ADDR=vtophys writes the result of spdk_mem_map_translate() on a private identity-style memory map per IO plus the 2 MiB page offset (the host-translation bound). On this substrate (no hugepages, no root, perf runs --no-huge) physical addresses are unavailable and spdk_vtophys() always fails, and nvme_pcie_vtophys() returns the VA on vfio-user, so this arm measures the SPDK mem-map translation lookup (the same 2-level table walk spdk_vtophys does on g_vtophys_map), i.e. the per-IO host-translation cost minus the page-table-specific result; w2 is the registered region's base plus offset, not a physical address (the device ignores it). The map is allocated once per process (SPDK replays every existing registration into it, so all DMA buffers are covered) and a probe of it on a 64 B DMA buffer at construct must succeed or construct fails with -ENOTSUP. So va = the shared-virtual-addressing bound (one store), vtophys = the per-IO mem-map translation lookup. Host only (nvmf_tgt is untouched and never reads w2). Built on 25's inv_flags architecture: new bit INV_F_ADDR (0x80) is added to INV_F_SUBMIT, so the stock submit keeps its single inv_flags test (only the immediate changes) and tail-calls inv_submit_lever(), which sends an ADDR qpair to inv_desc_submit (the stock-copy Mode D tracker submit with the sized descriptor); inside it the address is computed before a tracker is taken (a failed translation logs once and abort()s: sticky and loud, a retryable error would spin forever under -Q) and replaces the tracker cookie in w2 for contiguous payloads (non-contiguous payloads keep the cookie). Completions run in the lever loop inv_records_tr() like 25's DESC (INV_F_ADDR is in inv_process_completions' lever mask; the 4-word rec32 shape, or the matching word count when 23's rec bits are set), because the poll diverts on any nonzero inv_flags. The mode is parsed once into g_inv_addr (primed at load); the bit and inv_addr_b (1 = va, 2 = vtophys, at the struct tail, stock offsets unchanged) are set at construct on Mode D IO qpairs (vtophys: the private mem-map probe on a 64 B DMA buffer must succeed or construct fails with -ENOTSUP) without Mode E (mode 0 and Mode E ignore the env). With the env unset or none no bit is set and the stock submit is instruction-identical to 25's apart from the immediate of its one inv_flags test. MATCHED CONTROL REQUIRED: because ADDR arms run through the lever submit and lever completion, run L9 as IAU_INV_DESC_BYTES=40;SPDK_INV_ADDR=va|vtophys against IAU_INV_DESC_BYTES=40 alone (identical paths except w2); never against the unset stock path.
+# safety: SAFE (the device does not read w2 in Mode D: iau_decode_desc ignores it, and the host finds the tracker by cid)
+# breaks: none (w2 is ignored by the device); the descriptor format != LOCKED RTL format only in the content of an ignored word (overlay only, never in spdk/); requires 40 B or 64 B descriptors (IAU_INV_DESC_BYTES unset, 40 or 64): the 32 B descriptor drops w2 entirely, so SPDK_INV_ADDR with IAU_INV_DESC_BYTES=32 fails IO qpair construct with -ENOTSUP, as does combining it with SPDK_INV_TRFREE or SPDK_INV_THIN (those use their own submit/cid stack); a request that is not a read or write of at most 128 KiB fails with -ENOTSUP as in 25; per-IO cycle records are not taken on the lever paths (non-lean builds only); oracle overhead the design would not pay: the inv_submit_lever dispatch. §4 L evidence: host "INV_ADDR qid=N mode=va|vtophys" (the vtophys construct line reads "mode=vtophys (memmap)") per Mode D IO qpair at construct and, at destroy, "INV_ADDR qid=N all K cids returned at destroy (mode=...)" only when that qpair's cid pool is whole (23/25's inv_pool_state rule: every tracker back on free_tr and outstanding_tr empty), else an ERROR line with "lost IO"
+# env: SPDK_INV_ADDR=va|vtophys (default none; read by the host only)
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff,12-residue.diff,13-iport.diff,20-l1-trfree.diff,22-l2-thin.diff,23-l3-rec.diff,24-l4-idleflush.diff,25-l6-desc.diff,26-l7-app.diff
+diff -ruN a/lib/nvme/nvme_pcie_common.c b/lib/nvme/nvme_pcie_common.c
+--- a/lib/nvme/nvme_pcie_common.c	2026-10-14 01:47:48.394445865 +0000
++++ b/lib/nvme/nvme_pcie_common.c	2026-10-14 06:34:14.955015049 +0000
+@@ -39,6 +39,44 @@
+ static int g_inv_rec_env_set = -1;	/* IAU_INV_REC_BYTES non-empty; -1 = unread */
+ static int64_t g_inv_desc_bytes = -1;	/* IAU_INV_DESC_BYTES (strtoll); default 40 */
+ static int g_inv_desc_env_set = -1;	/* IAU_INV_DESC_BYTES non-empty; -1 = unread */
++static int64_t g_inv_addr = -1;		/* SPDK_INV_ADDR: none = 0, va = 1, vtophys = 2; -1 = unread */
++
++/* inv 27-l9-addr: private identity memory map for the vtophys arm. Without hugepages (the
++ * harness runs --no-huge) SPDK has no physical addresses and spdk_vtophys() always fails, so the
++ * arm pays the same per-IO lookup (spdk_mem_map_translate: the 2-level table walk spdk_vtophys
++ * does on its own map) on a private map whose translation is the registered region's base. SPDK replays
++ * every existing registration into a new map, so all DMA buffers are covered. */
++static struct spdk_mem_map *g_inv_addr_map;
++
++static int
++inv_addr_map_notify(void *cb_ctx, struct spdk_mem_map *map, enum spdk_mem_map_notify_action action,
++		    void *vaddr, size_t size)
++{
++	if (action == SPDK_MEM_MAP_NOTIFY_REGISTER) {
++		return spdk_mem_map_set_translation(map, (uint64_t)(uintptr_t)vaddr, size,
++						    (uint64_t)(uintptr_t)vaddr);
++	}
++	return spdk_mem_map_clear_translation(map, (uint64_t)(uintptr_t)vaddr, size);
++}
++
++static const struct spdk_mem_map_ops g_inv_addr_map_ops = {
++	.notify_cb = inv_addr_map_notify,
++	.are_contiguous = NULL,
++};
++
++/* inv 27-l9-addr: SPDK_INV_ADDR = va | vtophys; unset, empty, none or anything else = 0.
++ * Parsed once into the cache (primed at load, so no worker thread fills it). */
++static inline int
++inv_addr_mode(void)
++{
++	if (spdk_unlikely(g_inv_addr < 0)) {
++		const char *e = getenv("SPDK_INV_ADDR");
++
++		g_inv_addr = (e == NULL) ? 0 : (strcmp(e, "va") == 0) ? 1 :
++			     (strcmp(e, "vtophys") == 0) ? 2 : 0;
++	}
++	return (int)g_inv_addr;
++}
+ 
+ /* inv 25-l6-desc: the Mode D descriptor size, IAU_INV_DESC_BYTES = 32|40|64; unset or any other
+  * value = the LOCKED 40 B descriptor. nvmf_tgt parses the same env with the same rule
+@@ -111,6 +149,7 @@
+ 	(void)inv_rec_env_set();
+ 	inv_env_i64("IAU_INV_DESC_BYTES", &g_inv_desc_bytes, 40);
+ 	(void)inv_desc_env_set();
++	(void)inv_addr_mode();
+ }
+ 
+ SPDK_STATIC_ASSERT(sizeof(struct nvme_uncore_cq_cb_rec) == 32, "LOCKED Mode D record is 32 B");
+@@ -653,6 +692,50 @@
+ 		}
+ 	}
+ 
++	/* inv 27-l9-addr: the data address in descriptor word w2 (spec I4 L9, D1): va = the raw
++	 * virtual address (shared-virtual-addressing bound), vtophys = nvme_pcie_vtophys() per IO
++	 * (host-translation bound). The device ignores w2 in Mode D. Mode D IO qpairs only (Mode
++	 * E and mode 0 ignore the env). It rides on the tracker submit (inv_desc_submit), so it
++	 * does not compose with 20 (trfree) or 22 (thin), which fail construct; the 32 B
++	 * descriptor has no w2, so it fails construct too (use 40 or 64). */
++	pqpair->inv_addr_b = 0;
++	if (qpair->id != 0 && inv_addr_mode() != 0 && uncore_mode_d() && !uncore_mode_e() &&
++	    pqpair->sq_desc_ring != NULL) {
++		if (pqpair->inv_desc_b == 32) {
++			NVME_QPAIR_ERRLOG(qpair, "inv 27: SPDK_INV_ADDR needs IAU_INV_DESC_BYTES 40 or "
++					  "64 (the 32 B descriptor has no w2)\n");
++			return -ENOTSUP;
++		}
++		if (pqpair->inv_flags & (INV_F_TRFREE | INV_F_THIN)) {
++			NVME_QPAIR_ERRLOG(qpair, "inv 27: SPDK_INV_ADDR does not compose with "
++					  "SPDK_INV_TRFREE or SPDK_INV_THIN\n");
++			return -ENOTSUP;
++		}
++		if (inv_addr_mode() == 2) {
++			/* Probe the lookup once on DMA memory: fail construct if it cannot translate. */
++			void *probe;
++			uint64_t pa = UINT64_MAX;
++
++			if (g_inv_addr_map == NULL) {
++				g_inv_addr_map = spdk_mem_map_alloc(UINT64_MAX, &g_inv_addr_map_ops, NULL);
++			}
++			probe = spdk_zmalloc(64, 64, NULL, SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
++			if (g_inv_addr_map != NULL && probe != NULL) {
++				pa = spdk_mem_map_translate(g_inv_addr_map, (uint64_t)(uintptr_t)probe, NULL);
++			}
++			spdk_free(probe);
++			if (pa == UINT64_MAX) {
++				NVME_QPAIR_ERRLOG(qpair, "inv 27: private mem-map probe failed on a DMA "
++						  "buffer\n");
++				return -ENOTSUP;
++			}
++		}
++		pqpair->inv_addr_b = (uint8_t)inv_addr_mode();
++		pqpair->inv_flags |= INV_F_ADDR;
++		fprintf(stderr, "INV_ADDR qid=%u mode=%s\n", qpair->id,
++			pqpair->inv_addr_b == 1 ? "va" : "vtophys (memmap)");
++	}
++
+ 	nvme_pcie_qpair_reset(qpair);
+ 
+ 	return 0;
+@@ -1562,7 +1645,7 @@
+ 		}
+ 		return inv_records_trfree(pqpair, max_completions, 4);
+ 	}
+-	if (mode_d && (inv & (INV_F_REC16 | INV_F_REC32 | INV_F_REC64 | INV_F_DESC))) {
++	if (mode_d && (inv & (INV_F_REC16 | INV_F_REC32 | INV_F_REC64 | INV_F_DESC | INV_F_ADDR))) {
+ 		if (inv & INV_F_REC16) {
+ 			return inv_records_tr(pqpair, max_completions, 2);
+ 		}
+@@ -2034,6 +2117,23 @@
+ 					  pqpair->inv_desc_logged);
+ 		}
+ 	}
++	if (pqpair->inv_addr_b != 0) {
++		/* inv 27-l9-addr: the §4 L evidence; the pool-whole rule is 23's. */
++		uint32_t cap, avail;
++		uint64_t extra;
++		bool whole = inv_pool_state(pqpair, &cap, &avail, &extra);
++		const char *m = pqpair->inv_addr_b == 1 ? "va" : "vtophys";
++
++		if (whole && avail == cap && extra == 0) {
++			fprintf(stderr, "INV_ADDR qid=%u all %u cids returned at destroy (mode=%s)\n",
++				qpair->id, cap, m);
++		} else {
++			NVME_QPAIR_ERRLOG(qpair, "INV_ADDR qid=%u at destroy: %u of %u cids free, "
++					  "outstanding list %s (lost IO), %" PRIu64 " extra cids "
++					  "(mode=%s)\n", qpair->id, avail, cap,
++					  whole ? "empty" : "not empty", extra, m);
++		}
++	}
+ 	if (pqpair->tr) {
+ 		spdk_free(pqpair->tr);
+ 	}
+@@ -2730,6 +2830,8 @@
+ 	struct nvme_pcie_qpair *pqpair = nvme_pcie_qpair(qpair);
+ 	struct nvme_tracker *tr;
+ 	uint32_t _idx = pqpair->sq_desc_tail;
++	uint64_t w2 = 0;
++	bool have_addr = false;
+ 
+ 	if (spdk_unlikely(req->payload_size > 131072u ||
+ 			  (req->cmd.opc != SPDK_NVME_OPC_READ && req->cmd.opc != SPDK_NVME_OPC_WRITE))) {
+@@ -2743,6 +2845,35 @@
+ 		}
+ 		return -ENOTSUP;
+ 	}
++	if (pqpair->inv_flags & INV_F_ADDR) {
++		/* inv 27-l9-addr: before a tracker is taken, so a failed translation unwinds nothing.
++		 * Contiguous payloads only (all perf issues); others keep the tracker cookie. */
++		if (nvme_payload_type(&req->payload) == NVME_PAYLOAD_TYPE_CONTIG) {
++			void *va = (uint8_t *)req->payload.contig_or_cb_arg + req->payload_offset;
++
++			/* vtophys = the per-IO mem-map lookup on the private identity map (see
++			 * g_inv_addr_map); nvme_pcie_vtophys() returns the VA on vfio-user. */
++			if (pqpair->inv_addr_b == 1) {
++				w2 = (uint64_t)(uintptr_t)va;
++			} else {
++				/* The map stores the registered region's base for every page of it
++				 * (set_translation is not per page), so add the 2 MiB offset like
++				 * spdk_vtophys does; the value is not a physical address. */
++				w2 = spdk_mem_map_translate(g_inv_addr_map, (uint64_t)(uintptr_t)va, NULL);
++				if (spdk_likely(w2 != UINT64_MAX)) {
++					w2 += (uint64_t)(uintptr_t)va & 0x1FFFFFu;
++				}
++			}
++			if (spdk_unlikely(w2 == UINT64_MAX)) {
++				/* Sticky and loud: a payload that cannot be translated is a harness
++				 * error, not a retryable one (-EAGAIN/-Q would spin forever). */
++				NVME_QPAIR_ERRLOG(qpair, "inv 27: mem-map translate failed for %p, aborting\n",
++						  va);
++				abort();
++			}
++			have_addr = true;
++		}
++	}
+ 	tr = TAILQ_FIRST(&pqpair->free_tr);
+ 	if (tr == NULL) {
+ 		pqpair->stat->queued_requests++;
+@@ -2766,7 +2897,7 @@
+ 		       ((uint64_t)(req->cmd.cdw12 & 0xFFFFu) << 16) |
+ 		       ((uint64_t)((req->cmd.cdw12 >> 16) & 0xFFFFu)),
+ 		       (uint64_t)req->cmd.cdw10 | ((uint64_t)req->cmd.cdw11 << 32),
+-		       (uint64_t)(uintptr_t)tr, (uint64_t)(uintptr_t)req->cb_arg,
++		       have_addr ? w2 : (uint64_t)(uintptr_t)tr, (uint64_t)(uintptr_t)req->cb_arg,
+ 		       (uint64_t)(uintptr_t)req->cb_fn);
+ 	pqpair->sq_desc_tail = (_idx + 1 == pqpair->num_entries) ? 0 : _idx + 1;
+ 	if (!pqpair->flags.delay_cmd_submit) {
+diff -ruN a/lib/nvme/nvme_pcie_internal.h b/lib/nvme/nvme_pcie_internal.h
+--- a/lib/nvme/nvme_pcie_internal.h	2026-10-14 01:47:48.395015413 +0000
++++ b/lib/nvme/nvme_pcie_internal.h	2026-10-14 01:48:32.146915652 +0000
+@@ -325,9 +325,9 @@
+ #define INV_F_REC64	0x10u	/* 23-l3-rec: 64 B Mode D records (one per line) */
+ #define INV_F_REC32	0x20u	/* 23-l3-rec: LOCKED 32 B records through the lever loops (control) */
+ #define INV_F_DESC	0x40u	/* 25-l6-desc: Mode D descriptor at inv_desc_b bytes (32|40|64) */
+-/* 0x80u: later levers */
++#define INV_F_ADDR	0x80u	/* 27-l9-addr: Mode D descriptor w2 carries the data address (inv_addr_b) */
+ /* inv_flags bits that divert nvme_pcie_qpair_submit_request into inv_submit_lever(). */
+-#define INV_F_SUBMIT	(INV_F_TRFREE | INV_F_DESC)
++#define INV_F_SUBMIT	(INV_F_TRFREE | INV_F_DESC | INV_F_ADDR)
+ 
+ /*
+  * inv 23-l3-rec (oracle, spec I4 L3; record format != the LOCKED RTL/gem5 format, overlay only).
+@@ -496,6 +496,7 @@
+ 	uint8_t inv_rec_logged;		/* inv 23: bytes in this qpair's INV_REC line; 0 = none */
+ 	uint8_t inv_desc_b;		/* inv 25: Mode D descriptor bytes (32|40|64), IO qpairs of Mode D */
+ 	uint8_t inv_desc_logged;	/* inv 25: bytes in this qpair's INV_DESC line; 0 = none */
++	uint8_t inv_addr_b;		/* inv 27: 1 = w2 is the data va, 2 = w2 is vtophys(va); 0 = off */
+ };
+ 
+ /* inv 22-l2-thin: one read with no nvme_request and no tracker (UNSAFE oracle, see the patch

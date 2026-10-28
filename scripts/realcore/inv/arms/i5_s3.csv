@@ -1,0 +1,6 @@
+arm_id,variant,tgt_variant,mode,env,trace
+stock-m0,inv-stock,,0,,
+stock-m4,inv-stock,,4,,
+l1-m4,inv-levers,,4,SPDK_INV_TRFREE=1,
+l1b-m0,inv-l1b,,0,,
+l1b-m4,inv-l1b,,4,,

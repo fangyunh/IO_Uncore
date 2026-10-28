@@ -1,0 +1,560 @@
+# inv-patch: 25-l6-desc
+# purpose: L6 oracle, Mode D descriptor size (spec I4 L6, H8): IAU_INV_DESC_BYTES=32|40|64 sets the SQ descriptor size on both sides (nvmf_tgt reads it once at transport create in iau_inv_desc_init(); the host library reads it at load time; same strtoll rule, any other value = the LOCKED 40 B). Layouts in 64-bit words: 40 B = LOCKED {w0 opc/fuse/cid/nlb-1/control, w1 slba, w2 cookie (tr), w3 cb_arg, w4 cb_fn}, 1.6 per 64 B line; 32 B = {w0, w1, cb_arg, cb_fn} (only the cookie w2 is dropped: the target never reads it, the host finds the tracker by cid, so every field the target decodes and this workload uses survives), 2 per line; 64 B = the 40 B descriptor at a 64 B stride, words 5..7 never written or read, 1 per line. Target: iau_fetch_one() keeps the original 40 B code (instruction-identical at -O2 plus one load+compare+not-taken branch) and tail-calls an out-of-line 32/64 B fetch; the descriptor-ring map length is qsize x the size. Host (20's inv_flags architecture): the descriptor ring is allocated at num_entries x the size; 32, exactly 40 and 64 set INV_F_DESC (0x40) on Mode D IO qpairs (not Mode E: 32/64 there fail construct with -ENOTSUP, 40 sets no bit), the stock submit's single inv_flags test now covers INV_F_SUBMIT = TRFREE|DESC and tail-calls inv_submit_lever(), which runs 20's trfree submit (now always inlined into it) or inv_desc_submit (a copy of the stock Mode D tracker submit that writes the sized descriptor through inv_write_desc; a request that is not a read or write of at most 128 KiB fails with -ENOTSUP, logged once); 20's trfree submit and 22's I-thin write use inv_write_desc only when INV_F_DESC is set (otherwise their original stores, so 22 and 20 arms with the env unset are unchanged apart from one inv_flags test in the I-thin write). INV_F_DESC without a rec bit completes through 23's lever record loop with 4 words (the rec32 shape), so INV_F_DESC at exactly 40 is the L6 control: read desc32/desc64 against desc40 (the descriptor-size effect) and desc40 against unset (the lever dispatch cost). The levers compose with 20 (trfree), 22 (I-thin) and 23 (record size). With the env unset no bit is set, nvme_pcie_qpair_submit_request compiles to the same instructions as before except the immediate of its one inv_flags test (and the call target), and stock nvme_pcie_qpair offsets are unchanged (inv_desc_b and inv_desc_logged at the tail)
+# safety: SAFE for this workload (perf reads and writes of at most 128 KiB, the cookie is never read by the target); the descriptor format != the LOCKED RTL/gem5 format (overlay only, never in spdk/)
+# breaks: descriptor format != LOCKED RTL format (overlay only); 32 B drops the cookie w2 (host tracker pointer; the target ignores it and the host finds the tracker by cid), 64 B only pads; nvmf_tgt and the host must see the same IAU_INV_DESC_BYTES (run_point exports it to both): a disagreement misparses every descriptor and usually hangs perf (no timeout; it can also crash on a garbage callback), and check_l.py FAILs the point when the target's INV_DESC line is missing, carries another env value, or gives other bytes than the host's construct lines; Mode D only (mode 0 ignores it); a host qpair with Mode E and a size other than 40 fails construct with -ENOTSUP; an IO qpair with the env at 32, 40 or 64 fails requests that are not reads or writes of at most 128 KiB with -ENOTSUP (no stock fallback); per-IO cycle records are not taken on the lever paths (non-lean builds only); oracle overhead the design would not pay: one inv_flags test in 22's thin write, a size branch per descriptor write, the inv_submit_lever dispatch and one load+compare per target fetch. §4 L evidence (printed only when IAU_INV_DESC_BYTES is non-empty, the target's rule): host "INV_DESC qid=N bytes=B per_line=K" per Mode D IO qpair at construct and, at destroy, "INV_DESC qid=N all K cids returned at destroy (bytes=B)" only when that qpair's cid pool is whole (the same rule as 23: thin stack, else trfree stack, else every tracker on free_tr and outstanding_tr empty), else an ERROR line with "lost IO"; target "INV_DESC target: env=V bytes=B per_line=K" at transport create (per_line = 64/B in integer division, so 1 for 40 B); check_l.py expects one destroy line per qpair in mode 4 and the size agreement above
+# env: IAU_INV_DESC_BYTES=32|40|64, read by BOTH nvmf_tgt and the host (target default 40 = the LOCKED fetch; the host sets INV_F_DESC only when the env is set and non-empty, never from the default; exactly 40 = the desc40 lever-path control, unset = the stock paths)
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff,12-residue.diff,13-iport.diff,20-l1-trfree.diff,22-l2-thin.diff,23-l3-rec.diff,24-l4-idleflush.diff
+diff -ruN a/lib/nvme/nvme_pcie_common.c b/lib/nvme/nvme_pcie_common.c
+--- a/lib/nvme/nvme_pcie_common.c	2026-10-14 07:25:18.037614742 +0000
++++ b/lib/nvme/nvme_pcie_common.c	2026-10-14 07:25:23.160296718 +0000
+@@ -37,6 +37,55 @@
+ static int64_t g_inv_thin = -1;
+ static int64_t g_inv_rec_bytes = -1;	/* IAU_INV_REC_BYTES (strtoll); 0 = unset or empty */
+ static int g_inv_rec_env_set = -1;	/* IAU_INV_REC_BYTES non-empty; -1 = unread */
++static int64_t g_inv_desc_bytes = -1;	/* IAU_INV_DESC_BYTES (strtoll); default 40 */
++static int g_inv_desc_env_set = -1;	/* IAU_INV_DESC_BYTES non-empty; -1 = unread */
++
++/* inv 25-l6-desc: the Mode D descriptor size, IAU_INV_DESC_BYTES = 32|40|64; unset or any other
++ * value = the LOCKED 40 B descriptor. nvmf_tgt parses the same env with the same rule
++ * (iau_inv_desc_init). Layouts, in 64-bit words: 40 B (LOCKED, struct nvme_uncore_sq_desc_d)
++ * w0 {opc, fuse, cid, nlb - 1, control}, w1 slba, w2 cookie (tr), w3 cb_arg, w4 cb_fn;
++ * 32 B drops the cookie (w2; the target never reads it, the host finds the tracker by cid):
++ * w0, w1, w3 -> word 2, w4 -> word 3, so every field the target decodes survives; 64 B is the
++ * 40 B descriptor with 24 B of padding never written or read, one per line. */
++static inline uint32_t
++inv_desc_bytes(void)
++{
++	int64_t v = inv_env_i64("IAU_INV_DESC_BYTES", &g_inv_desc_bytes, 40);
++
++	return (v == 32 || v == 64) ? (uint32_t)v : (uint32_t)sizeof(struct nvme_uncore_sq_desc_d);
++}
++
++/* inv 25: the env is set when it is non-empty (nvmf_tgt's rule for printing INV_DESC). */
++static inline bool
++inv_desc_env_set(void)
++{
++	if (spdk_unlikely(g_inv_desc_env_set < 0)) {
++		const char *e = getenv("IAU_INV_DESC_BYTES");
++
++		g_inv_desc_env_set = (e != NULL && e[0] != '\0');
++	}
++	return g_inv_desc_env_set == 1;
++}
++
++/* inv 25: write one Mode D descriptor at the configured stride; b = inv_desc_b. */
++static inline __attribute__((always_inline)) void
++inv_write_desc(struct nvme_pcie_qpair *pqpair, uint32_t idx, uint64_t w0, uint64_t w1, uint64_t w2,
++	       uint64_t w3, uint64_t w4)
++{
++	const uint32_t b = pqpair->inv_desc_b;
++	uint64_t *d = (uint64_t *)pqpair->sq_desc_ring + (size_t)idx * (b / 8);
++
++	d[0] = w0;
++	d[1] = w1;
++	if (b == 32) {
++		d[2] = w3;
++		d[3] = w4;
++	} else {
++		d[2] = w2;
++		d[3] = w3;
++		d[4] = w4;
++	}
++}
+ 
+ /* inv 23-l3-rec: the env is set when it is non-empty: nvmf_tgt's rule for printing its INV_REC
+  * line, so the host prints its lines under exactly the same condition. */
+@@ -60,6 +109,8 @@
+ 	inv_env_i64("SPDK_INV_THIN", &g_inv_thin, 0);
+ 	inv_env_i64("IAU_INV_REC_BYTES", &g_inv_rec_bytes, 0);
+ 	(void)inv_rec_env_set();
++	inv_env_i64("IAU_INV_DESC_BYTES", &g_inv_desc_bytes, 40);
++	(void)inv_desc_env_set();
+ }
+ 
+ SPDK_STATIC_ASSERT(sizeof(struct nvme_uncore_cq_cb_rec) == 32, "LOCKED Mode D record is 32 B");
+@@ -350,7 +401,9 @@
+ 		/* Mode D grows the descriptor to 40B and the record to 32B (carrying the
+ 		 * completion callback); Mode C uses 24B/16B.  Mode D sets both env vars,
+ 		 * so uncore_mode_c() is also true here — pick sizes by uncore_mode_d(). */
+-		size_t sq_elem = uncore_mode_d() ? sizeof(struct nvme_uncore_sq_desc_d)
++		/* inv 25-l6-desc: inv_desc_bytes() = 40 = sizeof(struct nvme_uncore_sq_desc_d) unless
++		 * IAU_INV_DESC_BYTES is 32 or 64; the target maps qsize * the same size. */
++		size_t sq_elem = uncore_mode_d() ? (size_t)inv_desc_bytes()
+ 						 : sizeof(struct nvme_uncore_sq_desc);
+ 		/* inv 23-l3-rec: inv_rec_bytes() = 32 = sizeof(struct nvme_uncore_cq_cb_rec) unless
+ 		 * IAU_INV_REC_BYTES is 16 or 64; the target maps qsize * the same size. */
+@@ -568,6 +621,38 @@
+ 		}
+ 	}
+ 
++	/* inv 25-l6-desc: the descriptor ring above was sized from the same knob. inv_desc_b is
++	 * always set on Mode D IO qpairs (the thin write reads it); the INV_F_DESC bit (32, 40 and
++	 * 64: exactly 40 is the control, the LOCKED descriptor through the same lever submit as
++	 * 32/64 B) diverts submit into inv_submit_lever() and, like 23's rec bits, sends the
++	 * completions through the lever loops (the 32 B record loop unless 20/22/23 pick another).
++	 * Set after 22 and 23, which assign or extend inv_flags. Mode E has its own submit: only
++	 * the LOCKED 40 B stays possible there, and with no bit. */
++	pqpair->inv_desc_b = (uint8_t)sizeof(struct nvme_uncore_sq_desc_d);
++	pqpair->inv_desc_logged = 0;
++	if (qpair->id != 0 && uncore_mode_d() && pqpair->sq_desc_ring != NULL) {
++		uint32_t db = inv_desc_bytes();
++		int64_t v = inv_env_i64("IAU_INV_DESC_BYTES", &g_inv_desc_bytes, 40);
++
++		if (db != sizeof(struct nvme_uncore_sq_desc_d) && uncore_mode_e()) {
++			NVME_QPAIR_ERRLOG(qpair, "inv 25: IAU_INV_DESC_BYTES=%u needs Mode D without "
++					  "Mode E\n", db);
++			return -ENOTSUP;
++		}
++		pqpair->inv_desc_b = (uint8_t)db;
++		if (inv_desc_env_set() && (v == 32 || v == 40 || v == 64) && !uncore_mode_e()) {
++			pqpair->inv_flags |= INV_F_DESC;
++		}
++		if (inv_desc_env_set()) {
++			/* §4 L evidence: the size this IO qpair writes; check_l.py balances it against
++			 * the destroy line and compares the bytes with nvmf_tgt's INV_DESC line. */
++			pqpair->inv_desc_logged = (uint8_t)db;
++			fprintf(stderr, "INV_DESC qid=%u bytes=%u per_line=%u%s\n", qpair->id, db,
++				64u / db, (v == 32 || v == 40 || v == 64) ? "" :
++				" (value not 32|40|64: LOCKED 40 B kept)");
++		}
++	}
++
+ 	nvme_pcie_qpair_reset(qpair);
+ 
+ 	return 0;
+@@ -1477,14 +1562,14 @@
+ 		}
+ 		return inv_records_trfree(pqpair, max_completions, 4);
+ 	}
+-	if (mode_d && (inv & (INV_F_REC16 | INV_F_REC32 | INV_F_REC64))) {
++	if (mode_d && (inv & (INV_F_REC16 | INV_F_REC32 | INV_F_REC64 | INV_F_DESC))) {
+ 		if (inv & INV_F_REC16) {
+ 			return inv_records_tr(pqpair, max_completions, 2);
+ 		}
+ 		if (inv & INV_F_REC64) {
+ 			return inv_records_tr(pqpair, max_completions, 8);
+ 		}
+-		return inv_records_tr(pqpair, max_completions, 4);	/* INV_F_REC32 control */
++		return inv_records_tr(pqpair, max_completions, 4);	/* INV_F_REC32 control; 25: INV_F_DESC alone */
+ 	}
+ 	inv_no_completion_path(pqpair, inv, mode_d);
+ 	return 0;
+@@ -1822,6 +1907,38 @@
+ 	return num_completions;
+ }
+ 
++/* inv 23/25: the cid pool this IO qpair uses (22 thin stack, else 20 trfree stack, else the
++ * tracker lists). Returns whole (no tracker left outstanding); *avail of *cap cids are free and
++ * *extra pushes found the pool full. The qpair is whole when whole && *avail == *cap && *extra == 0. */
++static bool
++inv_pool_state(const struct nvme_pcie_qpair *pqpair, uint32_t *cap, uint32_t *avail, uint64_t *extra)
++{
++	bool whole;
++
++	*avail = 0;
++	*extra = 0;
++	if (pqpair->inv_flags & INV_F_THIN) {
++		*cap = pqpair->inv_thin_cap;
++		*avail = pqpair->inv_thin_top;
++		*extra = pqpair->inv_thin_extra;
++		whole = true;
++	} else if (pqpair->inv_flags & INV_F_TRFREE) {
++		*cap = pqpair->inv_cid_cap;
++		*avail = pqpair->inv_cid_top;
++		*extra = pqpair->inv_cid_extra;
++		whole = true;
++	} else {
++		struct nvme_tracker *t;
++
++		*cap = (uint32_t)(pqpair->num_entries - pqpair->max_completions_cap);
++		TAILQ_FOREACH(t, &pqpair->free_tr, tq_list) {
++			(*avail)++;
++		}
++		whole = TAILQ_EMPTY(&pqpair->outstanding_tr);
++	}
++	return whole;
++}
++
+ int
+ nvme_pcie_qpair_destroy(struct spdk_nvme_qpair *qpair)
+ {
+@@ -1883,29 +2000,10 @@
+ 		 * line. The cid pool in use (22 thin stack, else 20 trfree stack, else the tracker
+ 		 * lists) must be whole: every IO submitted on this qpair completed exactly once.
+ 		 * cb_fn = the 16 B qpair's single registered callback (nil otherwise or without IO). */
+-		uint32_t cap, avail = 0;
+-		uint64_t extra = 0;
+-		bool whole;
+-
+-		if (pqpair->inv_flags & INV_F_THIN) {
+-			cap = pqpair->inv_thin_cap;
+-			avail = pqpair->inv_thin_top;
+-			extra = pqpair->inv_thin_extra;
+-			whole = true;
+-		} else if (pqpair->inv_flags & INV_F_TRFREE) {
+-			cap = pqpair->inv_cid_cap;
+-			avail = pqpair->inv_cid_top;
+-			extra = pqpair->inv_cid_extra;
+-			whole = true;
+-		} else {
+-			struct nvme_tracker *t;
++		uint32_t cap, avail;
++		uint64_t extra;
++		bool whole = inv_pool_state(pqpair, &cap, &avail, &extra);
+ 
+-			cap = (uint32_t)(pqpair->num_entries - pqpair->max_completions_cap);
+-			TAILQ_FOREACH(t, &pqpair->free_tr, tq_list) {
+-				avail++;
+-			}
+-			whole = TAILQ_EMPTY(&pqpair->outstanding_tr);
+-		}
+ 		if (whole && avail == cap && extra == 0) {
+ 			fprintf(stderr, "INV_REC qid=%u all %u cids returned at destroy (bytes=%u "
+ 				"cb_fn=%p)\n", qpair->id, cap, pqpair->inv_rec_logged,
+@@ -1918,6 +2016,24 @@
+ 					  pqpair->inv_rec_logged);
+ 		}
+ 	}
++	if (pqpair->inv_desc_logged != 0) {
++		/* inv 25-l6-desc: the §4 L evidence, for every qpair that printed an INV_DESC construct
++		 * line; the pool-whole rule is 23's. */
++		uint32_t cap, avail;
++		uint64_t extra;
++		bool whole = inv_pool_state(pqpair, &cap, &avail, &extra);
++
++		if (whole && avail == cap && extra == 0) {
++			fprintf(stderr, "INV_DESC qid=%u all %u cids returned at destroy (bytes=%u)\n",
++				qpair->id, cap, pqpair->inv_desc_logged);
++		} else {
++			NVME_QPAIR_ERRLOG(qpair, "INV_DESC qid=%u at destroy: %u of %u cids free, "
++					  "outstanding list %s (lost IO), %" PRIu64 " extra cids "
++					  "(bytes=%u)\n", qpair->id, avail, cap,
++					  whole ? "empty" : "not empty", extra,
++					  pqpair->inv_desc_logged);
++		}
++	}
+ 	if (pqpair->tr) {
+ 		spdk_free(pqpair->tr);
+ 	}
+@@ -2544,7 +2660,7 @@
+  * rides in the cb_fn slot (w4), which the unchanged device echoes in record w0. UNSAFE: in-flight
+  * IO cannot be aborted. A request the descriptor cannot carry fails loudly (no stock fallback:
+  * its tracker cid would collide with the stack's cids). */
+-static int __attribute__((noinline))
++static inline __attribute__((always_inline)) int
+ inv_trfree_submit(struct spdk_nvme_qpair *qpair, struct nvme_request *req)
+ {
+ 	struct nvme_pcie_qpair *pqpair = nvme_pcie_qpair(qpair);
+@@ -2570,18 +2686,88 @@
+ 	req->cmd.cid = pqpair->inv_cid_stack[--pqpair->inv_cid_top];
+ 	pqpair->stat->submitted_requests++;
+ 	pqpair->qpair.queue_depth++;
+-	ring_d[_idx].w0 = ((uint64_t)(req->cmd.opc & 0xFFu) << 56) |
+-			  ((uint64_t)(req->cmd.fuse & 0xFFu) << 48) |
+-			  ((uint64_t)req->cmd.cid << 32) |
+-			  ((uint64_t)(req->cmd.cdw12 & 0xFFFFu) << 16) |
+-			  ((uint64_t)((req->cmd.cdw12 >> 16) & 0xFFFFu));
+-	ring_d[_idx].w1 = (uint64_t)req->cmd.cdw10 | ((uint64_t)req->cmd.cdw11 << 32);
+-	ring_d[_idx].w2 = 0;
+-	/* inv 23: a 16 B record echoes only w3, so req rides there too (the completion then takes
+-	 * cb_fn and cb_arg from req). */
+-	ring_d[_idx].w3 = (pqpair->inv_flags & INV_F_REC16) ? (uint64_t)(uintptr_t)req :
+-			  (uint64_t)(uintptr_t)req->cb_arg;
+-	ring_d[_idx].w4 = (uint64_t)(uintptr_t)req;
++	if (pqpair->inv_flags & INV_F_DESC) {
++		/* inv 25-l6-desc: the descriptor at the configured size, same five values. */
++		inv_write_desc(pqpair, _idx,
++			       ((uint64_t)(req->cmd.opc & 0xFFu) << 56) |
++			       ((uint64_t)(req->cmd.fuse & 0xFFu) << 48) |
++			       ((uint64_t)req->cmd.cid << 32) |
++			       ((uint64_t)(req->cmd.cdw12 & 0xFFFFu) << 16) |
++			       ((uint64_t)((req->cmd.cdw12 >> 16) & 0xFFFFu)),
++			       (uint64_t)req->cmd.cdw10 | ((uint64_t)req->cmd.cdw11 << 32), 0,
++			       (pqpair->inv_flags & INV_F_REC16) ? (uint64_t)(uintptr_t)req :
++			       (uint64_t)(uintptr_t)req->cb_arg, (uint64_t)(uintptr_t)req);
++	} else {
++		ring_d[_idx].w0 = ((uint64_t)(req->cmd.opc & 0xFFu) << 56) |
++				  ((uint64_t)(req->cmd.fuse & 0xFFu) << 48) |
++				  ((uint64_t)req->cmd.cid << 32) |
++				  ((uint64_t)(req->cmd.cdw12 & 0xFFFFu) << 16) |
++				  ((uint64_t)((req->cmd.cdw12 >> 16) & 0xFFFFu));
++		ring_d[_idx].w1 = (uint64_t)req->cmd.cdw10 | ((uint64_t)req->cmd.cdw11 << 32);
++		ring_d[_idx].w2 = 0;
++		/* inv 23: a 16 B record echoes only w3, so req rides there too (the completion
++		 * then takes cb_fn and cb_arg from req). */
++		ring_d[_idx].w3 = (pqpair->inv_flags & INV_F_REC16) ? (uint64_t)(uintptr_t)req :
++				  (uint64_t)(uintptr_t)req->cb_arg;
++		ring_d[_idx].w4 = (uint64_t)(uintptr_t)req;
++	}
++	pqpair->sq_desc_tail = (_idx + 1 == pqpair->num_entries) ? 0 : _idx + 1;
++	if (!pqpair->flags.delay_cmd_submit) {
++		nvme_pcie_qpair_ring_sq_doorbell(qpair);
++		pqpair->last_sq_desc_tail = pqpair->sq_desc_tail;
++	}
++	return 0;
++}
++
++/* inv 25-l6-desc: the stock Mode D tracker submit with the descriptor written at inv_desc_b
++ * bytes (INV_F_DESC without INV_F_TRFREE). Same steps and order as the stock Mode D branch of
++ * nvme_pcie_qpair_submit_request (tracker from free_tr, outstanding_tr, w2 = tr, w3 = cb_arg,
++ * w4 = cb_fn, batched doorbell). A request the descriptor cannot carry fails loudly, as in
++ * trfree: IO qpairs of a Mode D lever run only issue reads and writes. */
++static int __attribute__((noinline))
++inv_desc_submit(struct spdk_nvme_qpair *qpair, struct nvme_request *req)
++{
++	struct nvme_pcie_qpair *pqpair = nvme_pcie_qpair(qpair);
++	struct nvme_tracker *tr;
++	uint32_t _idx = pqpair->sq_desc_tail;
++
++	if (spdk_unlikely(req->payload_size > 131072u ||
++			  (req->cmd.opc != SPDK_NVME_OPC_READ && req->cmd.opc != SPDK_NVME_OPC_WRITE))) {
++		static bool inv_warned;
++
++		if (!inv_warned) {
++			inv_warned = true;
++			NVME_QPAIR_ERRLOG(qpair, "inv desc: oracle cannot service this request "
++					  "(opc=0x%x payload_size=%u)\n", req->cmd.opc,
++					  req->payload_size);
++		}
++		return -ENOTSUP;
++	}
++	tr = TAILQ_FIRST(&pqpair->free_tr);
++	if (tr == NULL) {
++		pqpair->stat->queued_requests++;
++		return -EAGAIN;
++	}
++	pqpair->stat->submitted_requests++;
++	TAILQ_REMOVE(&pqpair->free_tr, tr, tq_list);
++	TAILQ_INSERT_TAIL(&pqpair->outstanding_tr, tr, tq_list);
++	pqpair->qpair.queue_depth++;
++	tr->req = req;
++	tr->cb_fn = req->cb_fn;
++	tr->cb_arg = req->cb_arg;
++	req->cmd.cid = tr->cid;
++	req->cmd.psdt = SPDK_NVME_PSDT_PRP;
++	req->cmd.dptr.prp.prp1 = 0;
++	req->cmd.dptr.prp.prp2 = 0;
++	inv_write_desc(pqpair, _idx,
++		       ((uint64_t)(req->cmd.opc & 0xFFu) << 56) |
++		       ((uint64_t)(req->cmd.fuse & 0xFFu) << 48) |
++		       ((uint64_t)req->cmd.cid << 32) |
++		       ((uint64_t)(req->cmd.cdw12 & 0xFFFFu) << 16) |
++		       ((uint64_t)((req->cmd.cdw12 >> 16) & 0xFFFFu)),
++		       (uint64_t)req->cmd.cdw10 | ((uint64_t)req->cmd.cdw11 << 32),
++		       (uint64_t)(uintptr_t)tr, (uint64_t)(uintptr_t)req->cb_arg,
++		       (uint64_t)(uintptr_t)req->cb_fn);
+ 	pqpair->sq_desc_tail = (_idx + 1 == pqpair->num_entries) ? 0 : _idx + 1;
+ 	if (!pqpair->flags.delay_cmd_submit) {
+ 		nvme_pcie_qpair_ring_sq_doorbell(qpair);
+@@ -2590,6 +2776,17 @@
+ 	return 0;
+ }
+ 
++/* inv: the lever submit, entered only when inv_flags & INV_F_SUBMIT (a tail call from the stock
++ * submit's single test). Dispatches on the submit-side bits. */
++static int __attribute__((noinline))
++inv_submit_lever(struct spdk_nvme_qpair *qpair, struct nvme_request *req)
++{
++	if (nvme_pcie_qpair(qpair)->inv_flags & INV_F_TRFREE) {
++		return inv_trfree_submit(qpair, req);
++	}
++	return inv_desc_submit(qpair, req);
++}
++
+ int
+ nvme_pcie_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request *req)
+ {
+@@ -2602,8 +2799,8 @@
+ 	bool			mptr_sgl_supported;
+ 	bool			dword_aligned = true;
+ 
+-	if (spdk_unlikely(pqpair->inv_flags & INV_F_TRFREE)) {
+-		return inv_trfree_submit(qpair, req);
++	if (spdk_unlikely(pqpair->inv_flags & INV_F_SUBMIT)) {
++		return inv_submit_lever(qpair, req);
+ 	}
+ 
+ 	if (spdk_unlikely(nvme_qpair_is_admin_queue(qpair))) {
+@@ -2833,12 +3030,21 @@
+ 			(struct nvme_uncore_sq_desc_d *)pqpair->sq_desc_ring;
+ 		uint32_t _idx = pqpair->sq_desc_tail;
+ 
+-		ring_d[_idx].w0 = ((uint64_t)SPDK_NVME_OPC_READ << 56) | ((uint64_t)cid << 32) |
+-				  ((uint64_t)((nlb - 1) & 0xFFFFu) << 16);
+-		ring_d[_idx].w1 = lba;
+-		ring_d[_idx].w2 = 0;
+-		ring_d[_idx].w3 = (uint64_t)(uintptr_t)cb_arg;
+-		ring_d[_idx].w4 = (uint64_t)(uintptr_t)cb_fn;
++		if (spdk_unlikely(inv & INV_F_DESC)) {
++			/* inv 25-l6-desc: the descriptor at the configured size, same five values. */
++			inv_write_desc(pqpair, _idx,
++				       ((uint64_t)SPDK_NVME_OPC_READ << 56) | ((uint64_t)cid << 32) |
++				       ((uint64_t)((nlb - 1) & 0xFFFFu) << 16), lba, 0,
++				       (uint64_t)(uintptr_t)cb_arg, (uint64_t)(uintptr_t)cb_fn);
++		} else {
++			ring_d[_idx].w0 = ((uint64_t)SPDK_NVME_OPC_READ << 56) |
++					  ((uint64_t)cid << 32) |
++					  ((uint64_t)((nlb - 1) & 0xFFFFu) << 16);
++			ring_d[_idx].w1 = lba;
++			ring_d[_idx].w2 = 0;
++			ring_d[_idx].w3 = (uint64_t)(uintptr_t)cb_arg;
++			ring_d[_idx].w4 = (uint64_t)(uintptr_t)cb_fn;
++		}
+ 		pqpair->sq_desc_tail = (_idx + 1 == pqpair->num_entries) ? 0 : _idx + 1;
+ 		if (!pqpair->flags.delay_cmd_submit) {
+ 			nvme_pcie_qpair_ring_sq_doorbell(qpair);
+diff -ruN a/lib/nvme/nvme_pcie_internal.h b/lib/nvme/nvme_pcie_internal.h
+--- a/lib/nvme/nvme_pcie_internal.h	2026-10-14 07:25:18.038212874 +0000
++++ b/lib/nvme/nvme_pcie_internal.h	2026-10-14 07:25:23.155773504 +0000
+@@ -324,7 +324,10 @@
+ #define INV_F_REC16	0x08u	/* 23-l3-rec: 16 B Mode D records; cb_fn = inv_cb_fn */
+ #define INV_F_REC64	0x10u	/* 23-l3-rec: 64 B Mode D records (one per line) */
+ #define INV_F_REC32	0x20u	/* 23-l3-rec: LOCKED 32 B records through the lever loops (control) */
+-/* 0x40u..0x80u: later levers */
++#define INV_F_DESC	0x40u	/* 25-l6-desc: Mode D descriptor at inv_desc_b bytes (32|40|64) */
++/* 0x80u: later levers */
++/* inv_flags bits that divert nvme_pcie_qpair_submit_request into inv_submit_lever(). */
++#define INV_F_SUBMIT	(INV_F_TRFREE | INV_F_DESC)
+ 
+ /*
+  * inv 23-l3-rec (oracle, spec I4 L3; record format != the LOCKED RTL/gem5 format, overlay only).
+@@ -491,6 +494,8 @@
+ 	uint64_t inv_thin_extra;	/* completions whose cid found the stack full */
+ 	spdk_nvme_cmd_cb inv_cb_fn;	/* inv 23: the single cb_fn of a 16 B-record qpair */
+ 	uint8_t inv_rec_logged;		/* inv 23: bytes in this qpair's INV_REC line; 0 = none */
++	uint8_t inv_desc_b;		/* inv 25: Mode D descriptor bytes (32|40|64), IO qpairs of Mode D */
++	uint8_t inv_desc_logged;	/* inv 25: bytes in this qpair's INV_DESC line; 0 = none */
+ };
+ 
+ /* inv 22-l2-thin: one read with no nvme_request and no tracker (UNSAFE oracle, see the patch
+diff -ruN a/lib/nvmf/vfio_user.c b/lib/nvmf/vfio_user.c
+--- a/lib/nvmf/vfio_user.c	2026-10-14 07:25:18.045816524 +0000
++++ b/lib/nvmf/vfio_user.c	2026-10-14 07:25:23.156281755 +0000
+@@ -1220,6 +1220,7 @@
+ 	}
+ 	iau_inv_rec_init();	/* inv 23-l3-rec: IAU_INV_REC_BYTES, read once at target init */
+ 	iau_inv_idle_init();	/* inv 24-l4-idleflush: IAU_INV_IDLE_FLUSH, read once at target init */
++	iau_inv_desc_init();	/* inv 25-l6-desc: IAU_INV_DESC_BYTES, read once at target init */
+ 
+ 	if (opts->transport_specific != NULL &&
+ 	    spdk_json_decode_object_relaxed(opts->transport_specific, vfio_user_transport_opts_decoder,
+@@ -2156,7 +2157,7 @@
+ 			err = -EINVAL;
+ 		} else {
+ 			desc_va = map_one(ctrlr->endpoint->vfu_ctx, desc_iova,
+-					  (uint64_t)qsize * IAU_DESC_D_BYTES,
++					  (uint64_t)qsize * iau_inv_desc_bytes(),	/* inv 25 */
+ 					  sq->iau_sg_desc, &sq->iau_iov_desc, MAP_R);
+ 			rec_va = map_one(ctrlr->endpoint->vfu_ctx, rec_iova,
+ 					 (uint64_t)qsize * iau_inv_rec_bytes(),	/* inv 23 */
+diff -ruN a/lib/nvmf/vfio_user_iau.c b/lib/nvmf/vfio_user_iau.c
+--- a/lib/nvmf/vfio_user_iau.c	2026-10-14 07:25:18.046452431 +0000
++++ b/lib/nvmf/vfio_user_iau.c	2026-10-14 07:25:23.156954418 +0000
+@@ -137,14 +137,81 @@
+ 	*cb_fn = d->w4;
+ }
+ 
++/* inv 25-l6-desc: the Mode D descriptor size (vfio_user_iau.h). Set once by iau_inv_desc_init()
++ * at transport create, before any SQ attaches, and read-only afterwards; without that call (unit
++ * tests) it stays the LOCKED 40 B. */
++static uint32_t g_iau_inv_desc_bytes = IAU_DESC_D_BYTES;
++
++void
++iau_inv_desc_init(void)
++{
++	const char *e = getenv("IAU_INV_DESC_BYTES");
++	long long v;
++
++	g_iau_inv_desc_bytes = IAU_DESC_D_BYTES;
++	if (e == NULL || e[0] == '\0') {
++		return;		/* unset: the LOCKED 40 B descriptor, no output */
++	}
++	v = strtoll(e, NULL, 10);	/* the host's rule (inv_env_i64), so both sides agree */
++	if (v == 32 || v == 64) {
++		g_iau_inv_desc_bytes = (uint32_t)v;
++	}
++	/* Stable format, parsed by scripts/realcore/inv/check_l.py (host/target size agreement). */
++	fprintf(stderr, "INV_DESC target: env=%s bytes=%u per_line=%u%s\n", e, g_iau_inv_desc_bytes,
++		64u / g_iau_inv_desc_bytes,
++		(v == 32 || v == 40 || v == 64) ? "" : " (value not 32|40|64: LOCKED 40 B kept)");
++}
++
++uint32_t
++iau_inv_desc_bytes(void)
++{
++	return g_iau_inv_desc_bytes;
++}
++
++/* inv 25-l6-desc: fetch and decode one 32 B (packed: w0, w1, cb_arg, cb_fn) or 64 B (the 40 B
++ * descriptor at a 64 B stride) descriptor, out of line so iau_fetch_one keeps its original code
++ * plus one load, compare and not-taken branch. All arguments keep iau_fetch_one's registers, so
++ * its tail call needs no moves; noipa keeps the signature. */
++static void __attribute__((noipa))
++iau_inv_fetch_sized(struct iau_ctx *ctx, uint16_t qid, struct spdk_nvme_cmd *cmd,
++		    uint64_t *cb_fn, uint64_t *cb_arg)
++{
++	struct iau_sq *sq = &ctx->sq[qid];
++	const uint32_t b = g_iau_inv_desc_bytes;
++	const volatile uint64_t *src = (const volatile uint64_t *)sq->desc_ring +
++				       (size_t)sq->dev_tail * (b / 8);
++	struct iau_desc_d d;
++
++	d.w0 = src[0];
++	d.w1 = src[1];
++	if (b == 32) {
++		d.w2 = 0;
++		d.w3 = src[2];
++		d.w4 = src[3];
++	} else {
++		d.w2 = src[2];
++		d.w3 = src[3];
++		d.w4 = src[4];
++	}
++	iau_decode_desc(&d, cmd, cb_fn, cb_arg);
++	sq->dev_tail = (sq->dev_tail + 1) % sq->entries;
++	sq->fetched++;
++}
++
+ void
+ iau_fetch_one(struct iau_ctx *ctx, uint16_t qid, struct spdk_nvme_cmd *cmd,
+ 	      uint64_t *cb_fn, uint64_t *cb_arg)
+ {
+-	struct iau_sq *sq = &ctx->sq[qid];
+-	const volatile struct iau_desc_d *src = &sq->desc_ring[sq->dev_tail];
++	struct iau_sq *sq;
++	const volatile struct iau_desc_d *src;
+ 	struct iau_desc_d d;
+ 
++	if (spdk_unlikely(g_iau_inv_desc_bytes != IAU_DESC_D_BYTES)) {
++		iau_inv_fetch_sized(ctx, qid, cmd, cb_fn, cb_arg);	/* inv 25: 32 B or 64 B */
++		return;
++	}
++	sq = &ctx->sq[qid];
++	src = &sq->desc_ring[sq->dev_tail];
+ 	d.w0 = src->w0;
+ 	d.w1 = src->w1;
+ 	d.w2 = src->w2;
+diff -ruN a/lib/nvmf/vfio_user_iau.h b/lib/nvmf/vfio_user_iau.h
+--- a/lib/nvmf/vfio_user_iau.h	2026-10-14 07:25:18.046615235 +0000
++++ b/lib/nvmf/vfio_user_iau.h	2026-10-14 07:25:23.157134668 +0000
+@@ -139,4 +139,20 @@
+ void iau_inv_rec_init(void);
+ uint32_t iau_inv_rec_bytes(void);	/* inv 23: IAU_INV_REC_BYTES = 16|32|64, default 32 */
+ 
++/*
++ * inv 25-l6-desc: investigation overlay oracle (spec I4 L6), NOT the LOCKED RTL/gem5 format.
++ * IAU_INV_DESC_BYTES = 32|40|64 picks the Mode D descriptor size; unset, empty or any other value
++ * keeps the LOCKED 40 B descriptor, fetched exactly as before. The host library parses the same
++ * env with the same rule (strtoll; 32 or 64, else 40). Layouts in 64-bit words:
++ *   40 B (LOCKED): w0 {opc, fuse, cid, nlb - 1, control}, w1 slba, w2 cookie, w3 cb_arg, w4 cb_fn.
++ *   32 B: w0, w1, then cb_arg, cb_fn (the cookie, never read here, is dropped). 2 per 64 B line.
++ *   64 B: the 40 B descriptor; words 5..7 are padding, never read. 1 per line.
++ * Read once at transport create (call before any SQ attaches). When the env is non-empty, prints
++ * "INV_DESC target: env=<value> bytes=<B> per_line=<K>" to stderr (stable: check_l.py checks it
++ * against the host's INV_DESC lines). iau_fetch_one() keeps the original 40 B code and branches
++ * out of line for 32/64 B.
++ */
++void iau_inv_desc_init(void);
++uint32_t iau_inv_desc_bytes(void);	/* inv 25: IAU_INV_DESC_BYTES = 32|40|64, default 40 */
++
+ #endif

@@ -1,0 +1,28 @@
+# inv-patch: 10-walk
+# purpose: compile out the O(QD) outstanding_tr walk in nvme_pcie_qpair_mark_doorbell_time under SPDK_NVME_IO_CYCLE_OFF (probe-only; t_sqe_copy is always 0 in lean)
+# safety: SAFE
+# breaks: none (instrumentation only)
+# env: none
+# base: 00-spin.diff,01-floor.diff
+diff -ruN a/lib/nvme/nvme_pcie_common.c b/lib/nvme/nvme_pcie_common.c
+--- a/lib/nvme/nvme_pcie_common.c	2026-10-13 21:59:39.316740567 +0000
++++ b/lib/nvme/nvme_pcie_common.c	2026-10-13 21:59:39.345654337 +0000
+@@ -49,6 +49,7 @@
+ static inline void
+ nvme_pcie_qpair_mark_doorbell_time(struct nvme_pcie_qpair *pqpair, uint64_t t_db)
+ {
++#ifndef SPDK_NVME_IO_CYCLE_OFF
+ 	struct nvme_tracker *tr;
+ 
+ 	TAILQ_FOREACH(tr, &pqpair->outstanding_tr, tq_list) {
+@@ -57,6 +58,10 @@
+ 			tr->req->t_poll_start = pqpair->poll_cycle_accum;
+ 		}
+ 	}
++#else
++	(void)pqpair;
++	(void)t_db;
++#endif
+ }
+ 
+ static inline uint64_t

@@ -1,0 +1,521 @@
+# inv-patch: 22-l2-thin
+# purpose: L2 oracle, the matched thin path pair of spec §5.2 (built on 20's inv_flags architecture): with SPDK_INV_THIN=1 perf selects a thin fn table once (stock nvme_submit_io untouched) whose submit calls spdk_nvme_inv_thin_read() for every read (no nvme_request, no tracker, no generic layer); both arms take the cid from one compact LIFO stack (num_trackers deep) and batch the SQ doorbell like stock, and their completions run in the noinline lever loops; B-thin (mode 0, INV_F_THIN) keeps cb_fn/cb_arg in a per-cid context array, writes the 64 B SQE straight into the SQ slot with four 16 B streaming stores from registers (PRP1 = the task buffer address translated once at init) and consumes CQEs by phase bit; I-thin (mode 4, INV_F_THIN|INV_F_ITHIN) writes the stock-packed 40 B Mode D descriptor and the completion record calls the echoed callback; with the env unset the inv-levers hot paths keep the inv-stock code plus 20's one inv_flags test per poll and per submit
+# safety: UNSAFE
+# breaks: the generic layer (no nvme_request: no split, retry, abort, timeout, admin); thin IO is invisible to abort, timeout, teardown and iterate_requests, and nvme_pcie_qpair_reset does not re-seed the stack (in-flight IO across a reset is lost); reads only, one ns (the Mode D descriptor carries no nsid); QD per qpair must be <= num_trackers (num_entries - max_completions_cap, 896 with the 1024-entry target queues), beyond that the thin call returns -EAGAIN (perf requeues it under -Q, drops it otherwise); with the env set every IO qpair is thin and must not see generic-path IO (cid collision), so perf fails the run loudly (status 1, draining) instead of falling back: writes, IO over 4 KiB, metadata, IO flags, more than one iovec, or a qpair without thin state (mode C only or Mode E: the library logs and leaves it stock); thin supersedes SPDK_INV_TRFREE on the same qpair; perf page-aligns its buffers while the env is set; the SQ-in-CMB max-access-width quirk is not honored; qpair.queue_depth, num_outstanding_reqs and submitted_requests do not count thin IO; per-IO cycle records are not taken. D1 asymmetry: B-thin carries nsid and PRP1, I-thin carries no data address (D1), so read the pair together with L9 (data-address cost). §4 L evidence: one stderr line per IO qpair at destroy, "INV_THIN qid=N all K cids returned at destroy", or an ERROR line counting lost and extra cids
+# env: SPDK_INV_THIN=1 (default off; mode 0 = B-thin, mode 4 = I-thin)
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff,12-residue.diff,13-iport.diff,20-l1-trfree.diff
+diff -ruN a/app/spdk_nvme_perf/perf.c b/app/spdk_nvme_perf/perf.c
+--- a/app/spdk_nvme_perf/perf.c	2026-10-14 00:52:18.157481755 +0000
++++ b/app/spdk_nvme_perf/perf.c	2026-10-14 00:52:18.189521048 +0000
+@@ -39,6 +39,11 @@
+ #include <libaio.h>
+ #endif
+ 
++/* inv 22-l2-thin: the thin read API lib/nvme exports in this overlay (nvme_pcie_common.c). */
++int spdk_nvme_inv_thin_read(struct spdk_nvme_qpair *qpair, uint32_t nsid, uint64_t lba,
++			    uint32_t nlb, uint64_t buf_iova, spdk_nvme_cmd_cb cb_fn, void *cb_arg);
++static bool g_inv_thin;	/* SPDK_INV_THIN=1, parsed once in main() */
++
+ #define HELP_RETURN_CODE UINT16_MAX
+ 
+ struct ctrlr_entry {
+@@ -170,6 +175,7 @@
+ 	struct spdk_histogram_data	*histogram;
+ 	int				status;
+ 	void			*inv_floor;	/* inv 01-floor loopback queue */
++	uint32_t		inv_nsid;	/* inv 22-l2-thin: nsid, read once at init */
+ };
+ 
+ struct perf_task {
+@@ -186,6 +192,7 @@
+ 	struct iocb		iocb;
+ #endif
+ 	TAILQ_ENTRY(perf_task)	link;
++	uint64_t		inv_iova;	/* inv 22-l2-thin: buffer IOVA, translated once */
+ };
+ 
+ struct worker_thread {
+@@ -1449,6 +1456,97 @@
+ 	.dump_transport_stats	= nvme_dump_transport_stats
+ };
+ 
++/* inv 22-l2-thin: SPDK_INV_THIN=1 selects this table once in register_ns(), so the stock
++ * nvme_fn_table and nvme_submit_io stay untouched. Every IO goes through
++ * spdk_nvme_inv_thin_read(): a thin qpair must never see a generic-path request (its tracker cid
++ * would collide with the thin stack), so anything the thin call cannot carry fails loudly. */
++static void
++nvme_thin_setup_payload(struct perf_task *task, uint8_t pattern)
++{
++	struct ns_entry *entry = task->ns_ctx->entry;
++	void *buf;
++
++	nvme_setup_payload(task, pattern);	/* g_io_align is >= 4 KiB while thin is on (main) */
++	buf = task->iovs[0].iov_base;
++	/* One PRP entry: one iovec, a page-aligned buffer, at most 4 KiB, no metadata, no flags. */
++	if (task->iovcnt != 1 || entry->md_size != 0 || entry->io_flags != 0 ||
++	    g_io_size_bytes > 0x1000u || ((uintptr_t)buf & 0xFFFu) != 0) {
++		fprintf(stderr, "inv thin: ERROR: SPDK_INV_THIN=1 needs single-PRP IO (iovcnt=%d "
++			"md_size=%u io_flags=0x%x io_size=%u buf=%p)\n", task->iovcnt,
++			entry->md_size, entry->io_flags, g_io_size_bytes, buf);
++		exit(1);
++	}
++	/* Translate once, as nvme_pcie_vtophys() would: PCIe = spdk_vtophys, vfio-user = VA. */
++	if (spdk_nvme_ctrlr_get_transport_id(entry->u.nvme.ctrlr)->trtype ==
++	    SPDK_NVME_TRANSPORT_PCIE) {
++		task->inv_iova = spdk_vtophys(buf, NULL);
++		if (task->inv_iova == SPDK_VTOPHYS_ERROR) {
++			fprintf(stderr, "inv thin: ERROR: spdk_vtophys(%p) failed\n", buf);
++			exit(1);
++		}
++	} else {
++		task->inv_iova = (uint64_t)(uintptr_t)buf;
++	}
++}
++
++/* A write (or a qpair without thin state): fail the ns_ctx and stop submitting, so an IO the
++ * thin path cannot carry is neither sent down the generic path nor requeued forever by -Q. */
++static int __attribute__((noinline, cold))
++inv_thin_fail(struct perf_task *task, struct ns_worker_ctx *ns_ctx, int rc)
++{
++	static bool warned;
++
++	if (!__atomic_exchange_n(&warned, true, __ATOMIC_RELAXED)) {
++		fprintf(stderr, "inv thin: ERROR: IO not submitted (is_read=%d rc=%d); "
++			"SPDK_INV_THIN=1 carries single-PRP reads on thin qpairs only\n",
++			(int)task->is_read, rc);
++	}
++	ns_ctx->status = 1;
++	ns_ctx->is_draining = true;
++	return rc;
++}
++
++static int
++nvme_thin_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
++		    struct ns_entry *entry, uint64_t offset_in_ios)
++{
++	int qp_num;
++	int rc;
++
++	qp_num = ns_ctx->u.nvme.last_qpair;
++	ns_ctx->u.nvme.last_qpair++;
++	if (ns_ctx->u.nvme.last_qpair == ns_ctx->u.nvme.num_active_qpairs) {
++		ns_ctx->u.nvme.last_qpair = 0;
++	}
++	if (spdk_unlikely(!task->is_read)) {
++		return inv_thin_fail(task, ns_ctx, -ENOTSUP);
++	}
++	rc = spdk_nvme_inv_thin_read(ns_ctx->u.nvme.qpair[qp_num], ns_ctx->inv_nsid,
++				     offset_in_ios * entry->io_size_blocks, entry->io_size_blocks,
++				     task->inv_iova, io_complete, task);
++	if (spdk_unlikely(rc != 0 && rc != -EAGAIN)) {
++		return inv_thin_fail(task, ns_ctx, rc);
++	}
++	return rc;	/* -EAGAIN: no free cid (QD per qpair > num_trackers) */
++}
++
++static int
++nvme_thin_init_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
++{
++	ns_ctx->inv_nsid = spdk_nvme_ns_get_id(ns_ctx->entry->u.nvme.ns);
++	return nvme_init_ns_worker_ctx(ns_ctx);
++}
++
++static const struct ns_fn_table nvme_thin_fn_table = {
++	.setup_payload		= nvme_thin_setup_payload,
++	.submit_io		= nvme_thin_submit_io,
++	.check_io		= nvme_check_io,
++	.verify_io		= nvme_verify_io,
++	.init_ns_worker_ctx	= nvme_thin_init_ns_worker_ctx,
++	.cleanup_ns_worker_ctx	= nvme_cleanup_ns_worker_ctx,
++	.dump_transport_stats	= nvme_dump_transport_stats
++};
++
+ static void
+ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
+ {
+@@ -1509,6 +1607,9 @@
+ 	inv_floor_env = getenv("SPDK_INV_FLOOR");
+ 	entry->fn_table = (inv_floor_env != NULL && strcmp(inv_floor_env, "1") == 0) ?
+ 			  &inv_floor_fn_table : &nvme_fn_table;
++	if (g_inv_thin && entry->fn_table == &nvme_fn_table) {
++		entry->fn_table = &nvme_thin_fn_table;	/* inv 22-l2-thin */
++	}
+ 	entry->u.nvme.ctrlr = ctrlr;
+ 	entry->u.nvme.ns = ns;
+ 	entry->num_io_requests = entries * spdk_divide_round_up(g_queue_depth, g_nr_io_queues_per_ns);
+@@ -3699,6 +3800,19 @@
+ 		goto out;
+ 	}
+ 
++	/* inv 22-l2-thin: parse once, here, with the library's rule (strtoll == 1), so app and
++	 * library agree; thin buffers are page-aligned so one PRP entry covers a 4 KiB IO. */
++	{
++		const char *inv_thin_env = getenv("SPDK_INV_THIN");
++
++		g_inv_thin = inv_thin_env != NULL && inv_thin_env[0] != '\0' &&
++			     strtoll(inv_thin_env, NULL, 10) == 1;
++		if (g_inv_thin) {
++			g_io_align = spdk_max(g_io_align, 0x1000u);
++			printf("INV_THIN perf: thin fn table, IO buffers %u-aligned\n", g_io_align);
++		}
++	}
++
+ 	/* Transport statistics are printed from each thread.
+ 	 * To avoid mess in terminal, init and use mutex */
+ 	rc = pthread_mutex_init(&g_stats_mutex, NULL);
+diff -ruN a/lib/nvme/nvme_pcie_common.c b/lib/nvme/nvme_pcie_common.c
+--- a/lib/nvme/nvme_pcie_common.c	2026-10-14 00:52:18.181202194 +0000
++++ b/lib/nvme/nvme_pcie_common.c	2026-10-14 00:52:18.190601719 +0000
+@@ -34,6 +34,7 @@
+ }
+ 
+ static int64_t g_inv_trfree = -1;
++static int64_t g_inv_thin = -1;
+ 
+ /* inv: read every lever env once at load time, on the main thread, so no worker thread
+  * fills a cache lazily; qpair construct then turns the values into inv_flags bits. */
+@@ -41,6 +42,7 @@
+ inv_env_prime(void)
+ {
+ 	inv_env_i64("SPDK_INV_TRFREE", &g_inv_trfree, 0);
++	inv_env_i64("SPDK_INV_THIN", &g_inv_thin, 0);
+ }
+ 
+ static void nvme_pcie_fail_request_bad_vtophys(struct spdk_nvme_qpair *qpair,
+@@ -460,6 +462,44 @@
+ 		pqpair->inv_flags |= INV_F_TRFREE;
+ 	}
+ 
++	/* inv 22-l2-thin: mode 0 -> B-thin, Mode D without E -> I-thin; any other mode stays
++	 * stock and spdk_nvme_inv_thin_read() fails loudly. The stack holds num_trackers cids,
++	 * the in-flight cap the stock tracker pool enforces (max_completions_cap CQ slots stay
++	 * free for completions consumed but not yet doorbelled). Thin supersedes 20-l1-trfree
++	 * on the same qpair. */
++	if (qpair->id != 0 && inv_env_i64("SPDK_INV_THIN", &g_inv_thin, 0) == 1) {
++		bool ithin = uncore_mode_c() && uncore_mode_d() && !uncore_mode_e() &&
++			     pqpair->sq_desc_ring != NULL && pqpair->cq_rec_ring != NULL;
++
++		if (!uncore_mode_c() || ithin) {
++			pqpair->inv_thin = calloc(pqpair->num_entries, sizeof(*pqpair->inv_thin));
++			pqpair->inv_thin_stack = calloc(num_trackers, sizeof(uint16_t));
++			if (pqpair->inv_thin == NULL || pqpair->inv_thin_stack == NULL) {
++				free(pqpair->inv_thin);
++				free(pqpair->inv_thin_stack);
++				pqpair->inv_thin = NULL;
++				pqpair->inv_thin_stack = NULL;
++				return -ENOMEM;
++			}
++			/* LIFO: the most recently freed cid is reused first (gem5 §13 Mode E). */
++			for (i = 0; i < num_trackers; i++) {
++				pqpair->inv_thin_stack[i] = (uint16_t)(num_trackers - 1 - i);
++			}
++			pqpair->inv_thin_top = num_trackers;
++			pqpair->inv_thin_cap = num_trackers;
++			pqpair->inv_thin_extra = 0;
++			fprintf(stderr, "INV_THIN qid=%u path=%s cids=%u%s\n", qpair->id,
++				ithin ? "I-thin" : "B-thin", (unsigned)num_trackers,
++				(pqpair->inv_flags & INV_F_TRFREE) ?
++				" (SPDK_INV_TRFREE ignored)" : "");
++			pqpair->inv_flags = INV_F_THIN | (ithin ? INV_F_ITHIN : 0);
++		} else {
++			NVME_QPAIR_ERRLOG(qpair, "inv thin: SPDK_INV_THIN=1 needs mode 0 or "
++					  "Mode D without Mode E; qpair %u stays stock\n",
++					  qpair->id);
++		}
++	}
++
+ 	nvme_pcie_qpair_reset(qpair);
+ 
+ 	return 0;
+@@ -1157,6 +1197,94 @@
+ 	return num_completions;
+ }
+ 
++/* inv 22-l2-thin: return a cid to the shared stack. A push onto a full stack (a duplicate or bogus
++ * completion) is counted, never written, and reported at destroy. */
++static inline void
++inv_thin_push(struct nvme_pcie_qpair *pqpair, uint16_t cid)
++{
++	if (spdk_likely(pqpair->inv_thin_top < pqpair->inv_thin_cap)) {
++		pqpair->inv_thin_stack[pqpair->inv_thin_top++] = cid;
++	} else {
++		pqpair->inv_thin_extra++;
++	}
++}
++
++/* inv 22-l2-thin (I-thin): the record carries the callback; recycle the cid, call back. */
++static uint32_t
++inv_records_ithin(struct nvme_pcie_qpair *pqpair, uint32_t max_completions)
++{
++	uint64_t rec_cb_fn, rec_cb_arg, cpl_lo, cpl_hi;
++	uint32_t num_completions = 0;
++
++	while (inv_rec_pop(pqpair, &rec_cb_fn, &rec_cb_arg, &cpl_lo, &cpl_hi)) {
++		struct spdk_nvme_cpl cpl_rec;
++
++		memcpy((uint8_t *)&cpl_rec + 0, &cpl_lo, 8);
++		memcpy((uint8_t *)&cpl_rec + 8, &cpl_hi, 8);
++		inv_thin_push(pqpair, (uint16_t)((cpl_hi >> 32) & 0xFFFFu));
++		((spdk_nvme_cmd_cb)(uintptr_t)rec_cb_fn)((void *)(uintptr_t)rec_cb_arg, &cpl_rec);
++		if (++num_completions == max_completions) {
++			break;
++		}
++	}
++	return num_completions;
++}
++
++/* inv 22-l2-thin (B-thin): the stock CQ loop's bookkeeping (phase bit, next-entry check and
++ * prefetch, cq_head and phase advance, sq_head) with the per-cid context in place of the
++ * tracker. */
++static uint32_t
++inv_cqes_bthin(struct nvme_pcie_qpair *pqpair, uint32_t max_completions)
++{
++	struct spdk_nvme_cpl *cpl, *next_cpl;
++	uint32_t num_completions = 0;
++	uint16_t next_cq_head;
++	uint8_t next_phase;
++	bool next_is_valid = false;
++
++	while (1) {
++		const struct inv_thin_ctx *ctx;
++		spdk_nvme_cmd_cb cb_fn;
++		void *cb_arg;
++
++		cpl = &pqpair->cpl[pqpair->cq_head];
++		if (!next_is_valid && cpl->status.p != pqpair->flags.phase) {
++			break;
++		}
++		if (spdk_likely(pqpair->cq_head + 1 != pqpair->num_entries)) {
++			next_cq_head = pqpair->cq_head + 1;
++			next_phase = pqpair->flags.phase;
++		} else {
++			next_cq_head = 0;
++			next_phase = !pqpair->flags.phase;
++		}
++		next_cpl = &pqpair->cpl[next_cq_head];
++		next_is_valid = (next_cpl->status.p == next_phase);
++		if (next_is_valid) {
++			__builtin_prefetch(&pqpair->inv_thin[next_cpl->cid]);
++		}
++#if defined(__PPC64__) || defined(__riscv) || defined(__loongarch__)
++		spdk_mb();
++#elif defined(__aarch64__)
++		__asm volatile("dmb oshld" ::: "memory");
++#endif
++		if (spdk_unlikely(++pqpair->cq_head == pqpair->num_entries)) {
++			pqpair->cq_head = 0;
++			pqpair->flags.phase = !pqpair->flags.phase;
++		}
++		pqpair->sq_head = cpl->sqhd;
++		ctx = &pqpair->inv_thin[cpl->cid];
++		cb_fn = ctx->cb_fn;
++		cb_arg = ctx->cb_arg;
++		inv_thin_push(pqpair, cpl->cid);
++		cb_fn(cb_arg, cpl);
++		if (++num_completions == max_completions) {
++			break;
++		}
++	}
++	return num_completions;
++}
++
+ static void __attribute__((noinline, cold))
+ inv_no_completion_path(struct nvme_pcie_qpair *pqpair, uint8_t inv, bool mode_d)
+ {
+@@ -1177,6 +1305,14 @@
+ inv_process_completions(struct nvme_pcie_qpair *pqpair, uint32_t max_completions, bool mode_d,
+ 			uint8_t inv)
+ {
++	if (inv & INV_F_THIN) {
++		if (mode_d && (inv & INV_F_ITHIN)) {
++			return inv_records_ithin(pqpair, max_completions);
++		}
++		if (!mode_d && !(inv & INV_F_ITHIN)) {
++			return inv_cqes_bthin(pqpair, max_completions);
++		}
++	}
+ 	if (mode_d && (inv & INV_F_TRFREE)) {
+ 		return inv_records_trfree(pqpair, max_completions);
+ 	}
+@@ -1553,6 +1689,25 @@
+ 	}
+ 	free(pqpair->inv_cid_stack);
+ 	pqpair->inv_cid_stack = NULL;
++	if (pqpair->inv_flags & INV_F_THIN) {
++		/* inv 22-l2-thin: the §4 L evidence. Every cid back on the stack and no extra
++		 * push = every thin IO submitted was completed exactly once. */
++		uint32_t lost = pqpair->inv_thin_cap - pqpair->inv_thin_top;
++
++		if (lost == 0 && pqpair->inv_thin_extra == 0) {
++			fprintf(stderr, "INV_THIN qid=%u all %u cids returned at destroy\n",
++				qpair->id, pqpair->inv_thin_cap);
++		} else {
++			NVME_QPAIR_ERRLOG(qpair, "INV_THIN qid=%u at destroy: %u cids not returned "
++					  "(lost IO), %" PRIu64 " extra cids "
++					  "(duplicate completions)\n",
++					  qpair->id, lost, pqpair->inv_thin_extra);
++		}
++	}
++	free(pqpair->inv_thin);
++	free(pqpair->inv_thin_stack);
++	pqpair->inv_thin = NULL;
++	pqpair->inv_thin_stack = NULL;
+ 	if (pqpair->tr) {
+ 		spdk_free(pqpair->tr);
+ 	}
+@@ -2370,6 +2525,114 @@
+ 	return rc;
+ }
+ 
++/* inv 22-l2-thin ----------------------------------------------------------------------------- */
++
++SPDK_STATIC_ASSERT(offsetof(struct spdk_nvme_cmd, nsid) == 4, "SQE layout");
++SPDK_STATIC_ASSERT(offsetof(struct spdk_nvme_cmd, dptr.prp.prp1) == 24, "SQE layout");
++SPDK_STATIC_ASSERT(offsetof(struct spdk_nvme_cmd, cdw10) == 40, "SQE layout");
++SPDK_STATIC_ASSERT(offsetof(struct spdk_nvme_cmd, cdw12) == 48, "SQE layout");
++
++/* B-thin: build the 64 B read SQE straight in the SQ slot from registers, with the stock copy's
++ * four 16 B streaming stores: {dw0 = opc | cid << 16 (fuse 0, PRP), nsid | cdw2-3 0},
++ * {mptr 0 | prp1}, {prp2 0 | cdw10-11 = slba}, {cdw12 = nlb - 1, cdw13 0 | cdw14-15 0}. */
++static inline void
++inv_thin_write_sqe(struct spdk_nvme_cmd *slot, uint16_t cid, uint32_t nsid, uint64_t lba,
++		   uint32_t nlb, uint64_t prp1)
++{
++	const uint64_t dw01 = (uint64_t)SPDK_NVME_OPC_READ | ((uint64_t)cid << 16) |
++			      ((uint64_t)nsid << 32);
++	const uint64_t dw1213 = (uint64_t)((nlb - 1) & 0xFFFFu);
++#if defined(__SSE2__)
++	__m128i *d128 = (__m128i *)slot;
++
++	_mm_stream_si128(&d128[0], _mm_set_epi64x(0, (long long)dw01));
++	_mm_stream_si128(&d128[1], _mm_set_epi64x((long long)prp1, 0));
++	_mm_stream_si128(&d128[2], _mm_set_epi64x((long long)lba, 0));
++	_mm_stream_si128(&d128[3], _mm_set_epi64x(0, (long long)dw1213));
++#else
++	uint64_t *q = (uint64_t *)slot;
++
++	q[0] = dw01;
++	q[1] = 0;
++	q[2] = 0;
++	q[3] = prp1;
++	q[4] = 0;
++	q[5] = lba;
++	q[6] = dw1213;
++	q[7] = 0;
++#endif
++}
++
++static int __attribute__((noinline, cold))
++inv_thin_missing(struct spdk_nvme_qpair *qpair)
++{
++	static bool inv_warned;
++
++	if (!inv_warned) {
++		inv_warned = true;
++		NVME_QPAIR_ERRLOG(qpair, "inv thin: qpair %u has no thin state (SPDK_INV_THIN "
++				  "unset for the library, or not mode 0 / Mode D without E)\n",
++				  qpair->id);
++	}
++	return -ENXIO;
++}
++
++/* One read, no nvme_request, no tracker. I-thin (Mode D) writes the stock-packed descriptor;
++ * B-thin keeps the callback in the per-cid context and writes the SQE. Both take the cid from
++ * the same LIFO stack and batch the SQ doorbell exactly like their stock paths. UNSAFE oracle. */
++int
++spdk_nvme_inv_thin_read(struct spdk_nvme_qpair *qpair, uint32_t nsid, uint64_t lba, uint32_t nlb,
++			uint64_t buf_iova, spdk_nvme_cmd_cb cb_fn, void *cb_arg)
++{
++	struct nvme_pcie_qpair *pqpair = nvme_pcie_qpair(qpair);
++	const uint8_t inv = pqpair->inv_flags;
++	uint16_t cid;
++
++	if (spdk_unlikely(!(inv & INV_F_THIN))) {
++		return inv_thin_missing(qpair);
++	}
++	if (spdk_unlikely(pqpair->inv_thin_top == 0)) {
++		pqpair->stat->queued_requests++;
++		return -EAGAIN;
++	}
++	cid = pqpair->inv_thin_stack[--pqpair->inv_thin_top];
++	if (inv & INV_F_ITHIN) {
++		/* I-thin: the stock Mode D packing (w0 = {opc, fuse 0, cid, nlb - 1, control 0},
++		 * w1 = slba, no data address: D1); the device echoes w4 (cb_fn) into record w0 and
++		 * w3 (cb_arg) into record w1. */
++		struct nvme_uncore_sq_desc_d *ring_d =
++			(struct nvme_uncore_sq_desc_d *)pqpair->sq_desc_ring;
++		uint32_t _idx = pqpair->sq_desc_tail;
++
++		ring_d[_idx].w0 = ((uint64_t)SPDK_NVME_OPC_READ << 56) | ((uint64_t)cid << 32) |
++				  ((uint64_t)((nlb - 1) & 0xFFFFu) << 16);
++		ring_d[_idx].w1 = lba;
++		ring_d[_idx].w2 = 0;
++		ring_d[_idx].w3 = (uint64_t)(uintptr_t)cb_arg;
++		ring_d[_idx].w4 = (uint64_t)(uintptr_t)cb_fn;
++		pqpair->sq_desc_tail = (_idx + 1 == pqpair->num_entries) ? 0 : _idx + 1;
++		if (!pqpair->flags.delay_cmd_submit) {
++			nvme_pcie_qpair_ring_sq_doorbell(qpair);
++			pqpair->last_sq_desc_tail = pqpair->sq_desc_tail;
++		}
++	} else {
++		/* B-thin: PRP1 = the buffer address the app translated once at init. */
++		struct inv_thin_ctx *ctx = &pqpair->inv_thin[cid];
++
++		ctx->cb_fn = cb_fn;
++		ctx->cb_arg = cb_arg;
++		inv_thin_write_sqe(&pqpair->cmd[pqpair->sq_tail], cid, nsid, lba, nlb, buf_iova);
++		if (spdk_unlikely(++pqpair->sq_tail == pqpair->num_entries)) {
++			pqpair->sq_tail = 0;
++		}
++		/* Stock submit_tracker rings at once without touching last_sq_tail. */
++		if (!pqpair->flags.delay_cmd_submit) {
++			nvme_pcie_qpair_ring_sq_doorbell(qpair);
++		}
++	}
++	return 0;
++}
++
+ struct spdk_nvme_transport_poll_group *
+ nvme_pcie_poll_group_create(void)
+ {
+diff -ruN a/lib/nvme/nvme_pcie_internal.h b/lib/nvme/nvme_pcie_internal.h
+--- a/lib/nvme/nvme_pcie_internal.h	2026-10-14 00:52:18.181821466 +0000
++++ b/lib/nvme/nvme_pcie_internal.h	2026-10-14 00:52:18.191248265 +0000
+@@ -319,7 +319,15 @@
+  * - A lever whose bit reaches inv_process_completions() must handle its completions there.
+  */
+ #define INV_F_TRFREE	0x01u	/* 20-l1-trfree: Mode D, cid stack, req rides in w4 */
+-/* 0x02u..0x80u: later levers */
++#define INV_F_THIN	0x02u	/* 22-l2-thin: B-thin or I-thin (thin state allocated) */
++#define INV_F_ITHIN	0x04u	/* 22-l2-thin: I-thin (Mode D descriptors and records) */
++/* 0x08u..0x80u: later levers */
++
++/* inv 22-l2-thin (oracle): per-cid callback context for the thin baseline path (B-thin). */
++struct inv_thin_ctx {
++	spdk_nvme_cmd_cb	cb_fn;
++	void			*cb_arg;
++};
+ 
+ /* PCIe transport extensions for spdk_nvme_qpair */
+ struct nvme_pcie_qpair {
+@@ -448,8 +456,20 @@
+ 	uint16_t *inv_cid_stack;
+ 	uint32_t inv_cid_top;
+ 	uint32_t inv_cid_cap;
++	/* 22-l2-thin: one LIFO cid stack for both arms plus B-thin's per-cid callback context
++	 * (I-thin gets cb_fn/cb_arg back in the record); valid when inv_flags & INV_F_THIN. */
++	struct inv_thin_ctx *inv_thin;
++	uint16_t *inv_thin_stack;
++	uint32_t inv_thin_top;
++	uint32_t inv_thin_cap;
++	uint64_t inv_thin_extra;	/* completions whose cid found the stack full */
+ };
+ 
++/* inv 22-l2-thin: one read with no nvme_request and no tracker (UNSAFE oracle, see the patch
++ * header). Returns 0, -EAGAIN (no free cid) or -ENXIO (the qpair has no thin state). */
++int spdk_nvme_inv_thin_read(struct spdk_nvme_qpair *qpair, uint32_t nsid, uint64_t lba,
++			    uint32_t nlb, uint64_t buf_iova, spdk_nvme_cmd_cb cb_fn, void *cb_arg);
++
+ #ifdef SPDK_NVME_IO_CYCLE_OFF
+ /* inv: lever state must not move a stock field (lean layout: flags at 109, qpair at 112). */
+ SPDK_STATIC_ASSERT(offsetof(struct nvme_pcie_qpair, inv_flags) == 110, "inv_flags left the hole");

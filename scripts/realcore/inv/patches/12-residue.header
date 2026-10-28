@@ -1,0 +1,6 @@
+# inv-patch: 12-residue
+# purpose: B-stock — the fork's Mode-0 hot path equals upstream SPDK's
+# safety: SAFE
+# breaks: Modes B, C, E and 2B no longer work in this variant (not under test); SPDK_UNCORE_MODE_C=1 without _D falls through to the standard path and SPDK_UNCORE_MODE_E=1 runs as Mode D
+# env: none
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff

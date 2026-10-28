@@ -1,0 +1,6 @@
+# inv-patch: 90-lean6-scratch
+# purpose: reproduce the 2026-10-13 scratch lean6 result for the I0 gate
+# safety: UNSAFE
+# breaks: removes outstanding_tr on IO qpairs in both modes (abort/teardown of in-flight IO); scratch reproduction only
+# env: none
+# base: 00-spin.diff,01-floor.diff

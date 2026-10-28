@@ -1,0 +1,106 @@
+# inv-patch: 01-floor
+# purpose: app-only floor of spec §5.2 (loopback I/O table; an upper bound on app-only IOPS)
+# safety: SAFE
+# breaks: no device I/O while SPDK_INV_FLOOR=1 (by design); probe/attach and qpair allocation still need a live target
+# env: SPDK_INV_FLOOR=1 (default off)
+# base: 00-spin.diff
+diff -ruN a/app/spdk_nvme_perf/perf.c b/app/spdk_nvme_perf/perf.c
+--- a/app/spdk_nvme_perf/perf.c	2026-10-13 23:29:37.705257809 +0000
++++ b/app/spdk_nvme_perf/perf.c	2026-10-13 23:29:37.712388504 +0000
+@@ -169,6 +169,7 @@
+ 
+ 	struct spdk_histogram_data	*histogram;
+ 	int				status;
++	void			*inv_floor;	/* inv 01-floor loopback queue */
+ };
+ 
+ struct perf_task {
+@@ -1385,6 +1386,69 @@
+ 	.dump_transport_stats	= nvme_dump_transport_stats
+ };
+ 
++/* inv 01-floor: SPDK_INV_FLOOR=1 swaps the NVMe I/O table for a local loopback. submit_io queues
++ * the task; the next check_io completes it through io_complete(). Same app code, no NVMe library
++ * calls in steady state: the "floor" of spec §5.2. */
++struct inv_floor_q {
++	uint32_t		head, tail, mask;
++	struct perf_task	*t[];
++};
++static const struct spdk_nvme_cpl g_inv_floor_cpl = {};	/* all zero = success */
++
++static int
++inv_floor_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
++		    struct ns_entry *entry, uint64_t offset_in_ios)
++{
++	struct inv_floor_q *q = ns_ctx->inv_floor;
++
++	(void)entry;
++	(void)offset_in_ios;
++	if (spdk_unlikely(q == NULL)) {
++		uint32_t cap = 64;
++
++		while (cap < g_queue_depth) {
++			cap <<= 1;
++		}
++		q = calloc(1, sizeof(*q) + cap * sizeof(q->t[0]));
++		if (q == NULL) {
++			return -ENOMEM;
++		}
++		q->mask = cap - 1;
++		ns_ctx->inv_floor = q;
++	}
++	if (spdk_unlikely(q->tail - q->head == q->mask + 1)) {
++		return -EAGAIN;
++	}
++	q->t[q->tail++ & (q->mask)] = task;
++	return 0;
++}
++
++static int64_t
++inv_floor_check_io(struct ns_worker_ctx *ns_ctx)
++{
++	struct inv_floor_q *q = ns_ctx->inv_floor;
++	uint32_t n, i;
++
++	if (q == NULL) {
++		return 0;
++	}
++	n = q->tail - q->head;	/* complete only what was queued before this poll */
++	for (i = 0; i < n; i++) {
++		io_complete(q->t[q->head++ & (q->mask)], &g_inv_floor_cpl);
++	}
++	return n;
++}
++
++static const struct ns_fn_table inv_floor_fn_table = {
++	.setup_payload		= nvme_setup_payload,
++	.submit_io		= inv_floor_submit_io,
++	.check_io		= inv_floor_check_io,
++	.verify_io		= nvme_verify_io,
++	.init_ns_worker_ctx	= nvme_init_ns_worker_ctx,
++	.cleanup_ns_worker_ctx	= nvme_cleanup_ns_worker_ctx,
++	.dump_transport_stats	= nvme_dump_transport_stats
++};
++
+ static void
+ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
+ {
+@@ -1393,6 +1457,7 @@
+ 	uint32_t max_xfer_size, entries, sector_size;
+ 	uint64_t ns_size;
+ 	struct spdk_nvme_io_qpair_opts opts;
++	const char *inv_floor_env;
+ 
+ 	cdata = spdk_nvme_ctrlr_get_data(ctrlr);
+ 
+@@ -1441,7 +1506,9 @@
+ 	}
+ 
+ 	entry->type = ENTRY_TYPE_NVME_NS;
+-	entry->fn_table = &nvme_fn_table;
++	inv_floor_env = getenv("SPDK_INV_FLOOR");
++	entry->fn_table = (inv_floor_env != NULL && strcmp(inv_floor_env, "1") == 0) ?
++			  &inv_floor_fn_table : &nvme_fn_table;
+ 	entry->u.nvme.ctrlr = ctrlr;
+ 	entry->u.nvme.ns = ns;
+ 	entry->num_io_requests = entries * spdk_divide_round_up(g_queue_depth, g_nr_io_queues_per_ns);

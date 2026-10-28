@@ -1,0 +1,5 @@
+cell_id,app_cpus,dev_cpus,qd,qpairs,controllers,compute,lat,placement,env,workload,rwmix,io_size
+rr,0,4+5,128,2,1,0,1,same-socket,IAU_DEV_CHANNELS=64,randread,100,4096
+rw,0,4+5,128,2,1,0,1,same-socket,IAU_DEV_CHANNELS=64,randwrite,100,4096
+mx,0,4+5,128,2,1,0,1,same-socket,IAU_DEV_CHANNELS=64,randrw,70,4096
+q16,0,4,16,1,1,0,1,same-socket,IAU_DEV_CHANNELS=64,randread,100,4096

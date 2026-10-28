@@ -1,0 +1,776 @@
+# inv-patch: 29-l5-gring
+# purpose: L5 oracle (H12, the I5 S2b cells), a global per-poll-group Mode D record ring: an upper bound on what one shared completion stream per host poll group buys over per-qpair record rings (built on 20's trfree records, w0 = req). Two host modes, the same device: IAU_INV_GLOBAL_RING=1 = per-qpair poll calls retained, it isolates the per-qpair ring probe and batching; IAU_INV_GLOBAL_RING=2 = idle per-qpair calls skipped, it bounds per-queue polling elimination. H12 is read by comparing the q1 -> q8 slopes of l1 (SPDK_INV_TRFREE=1 alone), gring1 and gring2 from the same inv-gring binary; flatness is not assumed. Host: with IAU_INV_GLOBAL_RING=1|2 every trfree Mode D IO qpair (tail byte inv_gring_on, set at the end of construct; no inv_flags bit) joins its poll group's ring at connect. The first member allocates IAU_INV_GLOBAL_RING_ENTRIES (E, default 4096) x 32 B of zeroed DMA memory exactly as cq_rec_ring is allocated (struct inv_gring {ring, iova, head, phase = 1, entries, members, inflight_cap, budget, consumed} at the tail of struct nvme_pcie_poll_group; each member keeps a pointer to it at the qpair tail), and every member MMIO-writes the ring IOVA to CQ_REC_RING_IOVA_OFFSET + 8*qid on its own controller. Registration order relied on (perf: spdk_nvme_ctrlr_alloc_io_qpair with create_only, spdk_nvme_poll_group_add, spdk_nvme_ctrlr_connect_io_qpair; spdk_nvme_poll_group_add only accepts a DISCONNECTED qpair, so a qpair is always in its group before connect): construct writes the qpair's own record ring IOVA (stock); the generic layer sets qpair->poll_group; connect (_nvme_pcie_ctrlr_create_io_qpair) joins and rewrites the register BEFORE it submits CREATE IO CQ; nvmf_tgt reads the register only when it handles CREATE IO SQ (sent from the CQ completion) and no IO can be submitted before the SQ exists, so the device writes every record of a gring qpair to the shared ring from the first IO on. nvme_pcie_poll_group_process_completions tests one poll-group field (inv_gring.ring != NULL) and diverts through a cold one-jmp trampoline (as 20 does for the per-qpair poll) to inv_gring_poll_group (noinline, hot; one instantiation per mode, dispatched once per call on inv_gring.mode): the stock disconnected-qpair callbacks, then ONE in-order consume of the shared ring per call (at most the members' summed max_completions_cap, or completions_per_qpair per member when smaller; per record: w3 phase test, w0 = req, req->qpair -> pqpair, the cid pushed on that qpair's 20 stack, queue_depth--, a per-qpair credit inv_gring_done++, req->cb_fn(w1, &cpl), nvme_free_request), then the stock per-qpair loop (mode 2 skips the spdk_nvme_qpair_process_completions call of a member for which it would be a no-op, inv_gring_idle: no credit, last_sq_desc_tail == sq_desc_tail (no batched SQ doorbell pending), queued_req, aborting_queued_req and err_req_head empty, state ENABLED with transport_failure_reason NONE (nvme_qpair_check_enabled then has no side effect: it acts only on a CONNECTED qpair or on an ENABLED one whose failure reason a reset set), pcie_state READY, no deferred delete, no pending vtophys failure, controller not failed, no timeout callback; a member with a credit, a pending doorbell or queued work is called exactly as in mode 1), in which inv_process_completions returns a gring qpair's credit (and zeroes it) without reading its own record ring, so the stock poll tail (stats, batched SQ doorbell), nvme_qpair_resubmit_requests and the poll-group return value (perf's busy/idle tsc split) still see the completions (returning 0 there, as the plan text says, would starve resubmission and count every poll idle). Flow control: the device may write ordinal k only once the host consumed k - E; every unconsumed ordinal is an in-flight IO of a member, bounded per qpair by inv_gring_cap = min(cid stack, io_queue_requests + 1) (the request pool, enforced by the library), so a join fails with -ENOTSUP when the members' bounds would sum past E (perf: 3 x ceil(QD/qpairs) + 1 per qpair, e.g. 8 x 193 = 1544 for QD 512 on 8 qpairs, min(896, 1537) = 896 for QD 512 on 1 qpair; the num_entries sum would be 8 x 1024 > 4096 and reject q8). Target: with IAU_INV_GLOBAL_RING=1 or 2 (identical on the device; read once at transport create by iau_inv_gring_init) every Mode D SQ maps E x 32 B at its record ring IOVA and takes a reference on a process-wide table entry keyed by that IOVA (64 entries under a mutex, not the plan's 4: perf's default association makes max(app cores, controllers) poll groups, e.g. 8 rings for 8 app cores x 2 controllers, so 64 is ample; an entry is created with ordinal 0 by the first SQ and released by the last; one "INV_GRING target: iova=0x.. entries=E" line per entry); iau_flush tests one static flag after 23's size test and tail-calls iau_inv_flush_gring, which reserves the staged count of consecutive ordinals with one __atomic_fetch_add (ordinal k: slot k % E, phase 1 ^ ((k / E) & 1), so the first pass writes phase 1 as the host expects), writes w0..w2, spdk_wmb(), then w3 per record, and keeps the per-SQ credit accounting. Ordering caveat: producers on different device threads can publish ordinal k+1 before k; the host consumes strictly in order and waits on k (head-of-line), which can only add latency, never reorder or lose records; acceptable for a bound. With both envs unset nvme_pcie_qpair_submit_request and nvme_pcie_qpair_process_completions compile to the same instructions (only __LINE__ immediates differ), nvme_pcie_poll_group_process_completions gains one cmpq of the poll-group field + one not-taken jne (and a register renaming), iau_flush one rip-relative cmpb + one not-taken jne (plus a loop-alignment nop), and stock struct offsets are unchanged (new fields at the tails)
+# safety: UNSAFE
+# breaks: abort, timeout, reset and teardown of in-flight IO (20's, plus: a record of IO still in flight when its qpair left the group or was freed is still consumed by the group loop and touches that qpair; the direct nvme_pcie_qpair_process_completions call that nvme_pcie_ctrlr_delete_io_qpair makes after DELETE IO SQ only returns credits and does not drain the shared ring; the group loop does not run in the qpair's completion context, so a callback that frees its qpair is not deferred; reconnect rewrites only the shared ring IOVA, and when the last SQ of a ring is deleted on the target (every member reconnecting, or a controller reset) the target frees its table entry and recreates it at ordinal 0 on the next attach while the host ring keeps its head and phase: the ordinals desync and perf hangs); gring qpairs complete only through spdk_nvme_poll_group_process_completions (polling one directly returns credits and never consumes the ring); requires SPDK_INV_TRFREE=1 (LOCKED 32 B records, w0 = req): with IAU_INV_GLOBAL_RING=1|2 a Mode D IO qpair that is not trfree, or has SPDK_INV_THIN, IAU_INV_REC_BYTES=16|64, IAU_INV_DESC_BYTES, SPDK_INV_ADDR or SPDK_INV_PF, or Mode E, fails construct with -ENOTSUP (nvmf_tgt treats every Mode D record ring as shared, so there is no stock fallback; mode 0 ignores the env; any value other than 1 or 2 is off on both sides); per-poll-group ring only: a gring qpair connected outside a poll group fails connect with -ENOTSUP, and a group's qpairs must all be served by one nvmf_tgt process (the producer counter is per process; perf has one poll group per worker and namespace, so one controller per ring); IAU_INV_GLOBAL_RING_ENTRIES outside 1..65536 fails construct (host) and every Mode D SQ create (target); a join that would take the group's in-flight bound past E fails connect with -ENOTSUP (raise E on both sides); nvmf_tgt and the host must see the same IAU_INV_GLOBAL_RING and IAU_INV_GLOBAL_RING_ENTRIES (run_point exports IAU_INV_* to both): a disagreement corrupts host memory or hangs perf, and check_l.py FAILs a point whose host and target entries or IOVAs differ; at most 64 rings per nvmf_tgt process (more fail SQ create with -ENOSPC), and one host process per nvmf_tgt (the table is keyed by IOVA = host VA on vfio-user, so two host processes could collide); the target needs 32 B records (IAU_INV_REC_BYTES 16|64 fails SQ create); per-IO cycle records are not taken; polls and idle_polls count per-qpair calls (mode 2 does not count the skipped ones); oracle overhead the design would not pay: the poll-group field test (on the group's third cache line, otherwise cold in the stock path), one inv_gring_on test per poll in the lever loop (also paid by the 20 arm), the per-qpair credit increment per completion, one flag test per target flush and the 64-bit modulo and division per target flush (ordinal to slot and phase), and in mode 2 the inv_gring_idle predicate per member per poll; the cross-thread fetch-add contention on the shared counter and the 64 B lines two producers' 32 B records share are part of what the bound measures. §4 L evidence: host "INV_GRING ring=P iova=I entries=E mode=M" per ring at creation, "INV_GRING qid=N joined entries=E ring=P cap=K group_cap=G" per IO qpair at connect, "INV_GRING ring=P consumed=C members=M at destroy" per ring at poll-group destroy (the cid balance stays 20's "INV_TRFREE qid=N all K cids returned at destroy" line, not duplicated); target "INV_GRING target: iova=I entries=E" per ring; check_l.py expects one join line per IO qpair (qpairs x n_ctx, n_ctx = max(app cores, controllers): perf's default ns/worker association, one poll group per ns_ctx), one ring line (mode = the env value) and one destroy line (C > 0, M = 0) per poll group (n_ctx), every join's ring among the ring lines, E on every line, target IOVAs equal to the host ring IOVAs, and the sum of C equal to the sum of emitted= on the target's IAU_STATS lines; gring adds no inv_flags bit (INV_FLAGS stays 0x01)
+# env: IAU_INV_GLOBAL_RING=1|2 (1 = per-qpair poll calls retained, 2 = idle per-qpair calls skipped; the device is the same for both) and IAU_INV_GLOBAL_RING_ENTRIES=<E> (default 4096, 1..65536), read by BOTH nvmf_tgt (transport create) and the host (at load, inv_env_prime); requires SPDK_INV_TRFREE=1 on the host
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff,12-residue.diff,13-iport.diff,14-stathist.diff,20-l1-trfree.diff,22-l2-thin.diff,23-l3-rec.diff,24-l4-idleflush.diff,25-l6-desc.diff,26-l7-app.diff,27-l9-addr.diff,28-s4-dbspin.diff,30-l10-pf.diff
+diff -ruN a/lib/nvme/nvme_pcie_common.c b/lib/nvme/nvme_pcie_common.c
+--- a/lib/nvme/nvme_pcie_common.c	2026-10-14 14:11:19.365242072 +0000
++++ b/lib/nvme/nvme_pcie_common.c	2026-10-14 14:58:15.928629494 +0000
+@@ -139,6 +139,19 @@
+ }
+ 
+ static int64_t g_inv_pf = -1;		/* SPDK_INV_PF (strtoll); default 0 */
++static int64_t g_inv_gring = -1;	/* inv 29: IAU_INV_GLOBAL_RING (strtoll); 1|2 = on, default 0 */
++static int64_t g_inv_gring_entries = -1;	/* inv 29: IAU_INV_GLOBAL_RING_ENTRIES; default 4096 */
++
++/* inv 29-l5-gring: IAU_INV_GLOBAL_RING = 1 (per-qpair poll calls kept) or 2 (idle ones skipped);
++ * any other value = off, the target's rule. */
++static inline uint32_t
++inv_gring_mode(void)
++{
++	int64_t v = inv_env_i64("IAU_INV_GLOBAL_RING", &g_inv_gring, 0);
++
++	return (v == 1 || v == 2) ? (uint32_t)v : 0;
++}
++
+ static int64_t g_inv_db_spin_ns = -1;	/* SPDK_INV_DB_SPIN_NS (strtoll); default 0 */
+ static int64_t g_inv_db_spin_cycles = -1;	/* SPDK_INV_DB_SPIN_CYCLES (strtoll); default 0 */
+ static uint64_t g_inv_db_ticks;	/* TSC ticks per spin (ns knob), set at construct; 0 = no ns spin */
+@@ -182,6 +195,8 @@
+ 	inv_env_i64("SPDK_INV_DB_SPIN_NS", &g_inv_db_spin_ns, 0);
+ 	inv_env_i64("SPDK_INV_DB_SPIN_CYCLES", &g_inv_db_spin_cycles, 0);
+ 	inv_env_i64("SPDK_INV_PF", &g_inv_pf, 0);
++	inv_env_i64("IAU_INV_GLOBAL_RING", &g_inv_gring, 0);
++	inv_env_i64("IAU_INV_GLOBAL_RING_ENTRIES", &g_inv_gring_entries, INV_GRING_ENTRIES_DEFAULT);
+ }
+ 
+ SPDK_STATIC_ASSERT(sizeof(struct nvme_uncore_cq_cb_rec) == 32, "LOCKED Mode D record is 32 B");
+@@ -816,6 +831,45 @@
+ 		}
+ 	}
+ 
++	/* inv 29-l5-gring: with IAU_INV_GLOBAL_RING=1|2 nvmf_tgt treats the record ring of every Mode D
++	 * SQ as a shared ring of IAU_INV_GLOBAL_RING_ENTRIES records, so every Mode D IO qpair with a
++	 * record ring must complete through its poll group's shared ring: an ineligible one fails
++	 * construct here (no stock fallback). Eligible = 20's trfree path with the LOCKED 32 B record
++	 * (w0 = req): TRFREE, optionally REC32, nothing else (no THIN, REC16/64, DESC, ADDR, PF, not
++	 * Mode E). No inv_flags bit: the poll already diverts on TRFREE and inv_process_completions
++	 * tests inv_gring_on. The ring is joined at connect (_nvme_pcie_ctrlr_create_io_qpair), where
++	 * the poll group is known. Set last, once inv_flags and inv_pf are final. */
++	pqpair->inv_gring = NULL;
++	pqpair->inv_gring_on = 0;
++	pqpair->inv_gring_done = 0;
++	pqpair->inv_gring_cap = 0;
++	if (qpair->id != 0 && uncore_mode_d() && pqpair->cq_rec_ring != NULL &&
++	    inv_gring_mode() != 0) {
++		int64_t ge = inv_env_i64("IAU_INV_GLOBAL_RING_ENTRIES", &g_inv_gring_entries,
++					 INV_GRING_ENTRIES_DEFAULT);
++		const uint8_t f = pqpair->inv_flags;
++		uint32_t reqs = (opts != NULL) ? opts->io_queue_requests + 1 : pqpair->inv_cid_cap;
++
++		if (uncore_mode_e() || !(f & INV_F_TRFREE) ||
++		    (f & (INV_F_THIN | INV_F_ITHIN | INV_F_REC16 | INV_F_REC64 | INV_F_DESC | INV_F_ADDR)) ||
++		    pqpair->inv_pf != 0) {
++			NVME_QPAIR_ERRLOG(qpair, "inv 29: IAU_INV_GLOBAL_RING=1|2 needs Mode D (not E) with "
++					  "SPDK_INV_TRFREE=1 and 32 B records, without SPDK_INV_THIN, "
++					  "IAU_INV_DESC_BYTES, SPDK_INV_ADDR or SPDK_INV_PF (inv_flags=0x%02x "
++					  "pf=%u)\n", f, (unsigned)pqpair->inv_pf);
++			return -ENOTSUP;
++		}
++		if (ge < 1 || ge > INV_GRING_ENTRIES_MAX) {
++			NVME_QPAIR_ERRLOG(qpair, "inv 29: IAU_INV_GLOBAL_RING_ENTRIES=%" PRId64 " is outside "
++					  "1..%d\n", ge, INV_GRING_ENTRIES_MAX);
++			return -ENOTSUP;
++		}
++		/* In-flight IO of this qpair = IO whose record the host has not consumed: each holds a
++		 * stack cid and an nvme_request (the pool is io_queue_requests + the reserved one). */
++		pqpair->inv_gring_cap = spdk_min(pqpair->inv_cid_cap, reqs);
++		pqpair->inv_gring_on = 1;
++	}
++
+ 	/* inv 30-l10-pf guard: every IO qpair whose final inv_flags is nonzero says so, whichever
+ 	 * lever set the bits, so check_l.py can FAIL a point that has bits but no lever env (a
+ 	 * default that diverts the stock paths, like 25's old unset-env bug). */
+@@ -1128,6 +1182,106 @@
+ 	pqpair->pcie_state = NVME_PCIE_QPAIR_WAIT_FOR_SQ;
+ }
+ 
++/* inv 29-l5-gring: join the poll group's shared record ring at connect. Order relied on (perf:
++ * spdk_nvme_ctrlr_alloc_io_qpair with create_only, spdk_nvme_poll_group_add, then
++ * spdk_nvme_ctrlr_connect_io_qpair; spdk_nvme_poll_group_add only takes a DISCONNECTED qpair, so a
++ * qpair always joins its group before connect): (1) construct wrote the qpair's own record ring
++ * IOVA to CQ_REC_RING_IOVA[qid]; (2) the generic layer set qpair->poll_group; (3) connect lands
++ * here BEFORE the CREATE IO CQ admin command is submitted, so the register is rewritten with the
++ * shared ring's IOVA before nvmf_tgt reads it (at CREATE IO SQ, issued from the CQ completion);
++ * no IO can be submitted before the SQ exists. The first member allocates the ring. A reconnect
++ * of a member only rewrites the register (the target clears it on reset). */
++static int __attribute__((noinline, cold))
++inv_gring_join(struct nvme_pcie_qpair *pqpair)
++{
++	struct spdk_nvme_qpair *qpair = &pqpair->qpair;
++	struct nvme_pcie_ctrlr *pctrlr = nvme_pcie_ctrlr(qpair->ctrlr);
++	struct inv_gring *g;
++
++	if (qpair->poll_group == NULL) {
++		NVME_QPAIR_ERRLOG(qpair, "inv 29: IAU_INV_GLOBAL_RING=1|2 needs the IO qpair in a poll "
++				  "group before connect (per-poll-group ring only)\n");
++		return -ENOTSUP;
++	}
++	if (pctrlr->uncore_cq_rec_iova_reg == NULL) {
++		NVME_QPAIR_ERRLOG(qpair, "inv 29: the controller has no CQ_REC_RING_IOVA register\n");
++		return -ENOTSUP;
++	}
++	g = &SPDK_CONTAINEROF(qpair->poll_group, struct nvme_pcie_poll_group, group)->inv_gring;
++	if (pqpair->inv_gring != g) {
++		if (pqpair->inv_gring != NULL) {
++			NVME_QPAIR_ERRLOG(qpair, "inv 29: qpair still joined to another poll group\n");
++			return -EINVAL;
++		}
++		if (g->ring == NULL) {
++			/* Entries were validated at construct (same cache for every qpair). DMA memory
++			 * aligned to its power-of-two length, like the per-qpair record ring. */
++			uint32_t e = (uint32_t)g_inv_gring_entries;
++			size_t len = (size_t)e * sizeof(struct nvme_uncore_cq_cb_rec);
++			size_t align = spdk_max(spdk_align32pow2((uint32_t)len), (size_t)sysconf(_SC_PAGESIZE));
++			struct nvme_uncore_cq_cb_rec *ring;
++			uint64_t iova;
++
++			ring = spdk_zmalloc(len, align, NULL, SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
++			if (ring == NULL) {
++				NVME_QPAIR_ERRLOG(qpair, "inv 29: alloc of the shared record ring failed\n");
++				return -ENOMEM;
++			}
++			iova = nvme_pcie_vtophys(qpair->ctrlr, ring, NULL);
++			if (iova == SPDK_VTOPHYS_ERROR) {
++				NVME_QPAIR_ERRLOG(qpair, "inv 29: vtophys of the shared record ring failed\n");
++				spdk_free(ring);
++				return -EFAULT;
++			}
++			g->ring = ring;
++			g->bus_addr = iova;
++			g->consumed = 0;
++			g->head = 0;
++			g->phase = 1;	/* the device's first pass writes phase 1, like cq_rec_phase */
++			g->mode = (uint8_t)inv_gring_mode();	/* 1 or 2 (inv_gring_on implies on) */
++			g->entries = e;
++			g->members = 0;
++			g->inflight_cap = 0;
++			g->budget = 0;
++			fprintf(stderr, "INV_GRING ring=%p iova=0x%" PRIx64 " entries=%u mode=%u\n",
++				(void *)ring, iova, e, (unsigned)g->mode);
++		}
++		/* Flow control: the device may write ordinal k only once the host consumed k - entries.
++		 * Every unconsumed ordinal is an in-flight IO of a member, so the members' in-flight
++		 * bounds must sum to at most the ring size. */
++		if (g->inflight_cap + pqpair->inv_gring_cap > g->entries) {
++			NVME_QPAIR_ERRLOG(qpair, "inv 29: poll group in-flight bound %u + %u exceeds the "
++					  "shared ring's %u entries (raise IAU_INV_GLOBAL_RING_ENTRIES on "
++					  "both sides)\n", g->inflight_cap, pqpair->inv_gring_cap, g->entries);
++			return -ENOTSUP;
++		}
++		g->inflight_cap += pqpair->inv_gring_cap;
++		g->budget += pqpair->max_completions_cap;
++		g->members++;
++		pqpair->inv_gring = g;
++		fprintf(stderr, "INV_GRING qid=%u joined entries=%u ring=%p cap=%u group_cap=%u\n",
++			qpair->id, g->entries, (void *)g->ring, pqpair->inv_gring_cap, g->inflight_cap);
++	}
++	g_thread_mmio_ctrlr = pctrlr;
++	spdk_mmio_write_8(&pctrlr->uncore_cq_rec_iova_reg[qpair->id], g->bus_addr);
++	g_thread_mmio_ctrlr = NULL;
++	return 0;
++}
++
++/* inv 29-l5-gring: leave the poll group's ring (poll-group remove, or destroy as a safety net).
++ * The ring stays allocated until the poll group is destroyed; records of IO still in flight
++ * would still be consumed for this qpair (teardown with in-flight IO is not supported). */
++static void __attribute__((noinline, cold))
++inv_gring_leave(struct nvme_pcie_qpair *pqpair)
++{
++	struct inv_gring *g = pqpair->inv_gring;
++
++	g->inflight_cap -= pqpair->inv_gring_cap;
++	g->budget -= pqpair->max_completions_cap;
++	g->members--;
++	pqpair->inv_gring = NULL;
++}
++
+ static int
+ _nvme_pcie_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair,
+ 				 uint16_t qid)
+@@ -1153,6 +1307,15 @@
+ 		}
+ 	}
+ 
++	if (spdk_unlikely(pqpair->inv_gring_on)) {
++		/* inv 29-l5-gring: before CREATE IO CQ (see inv_gring_join). */
++		rc = inv_gring_join(pqpair);
++		if (rc != 0) {
++			nvme_qpair_set_state(qpair, NVME_QPAIR_DISCONNECTED);
++			return rc;
++		}
++	}
++
+ 	rc = nvme_pcie_ctrlr_cmd_create_io_cq(ctrlr, qpair, nvme_completion_create_cq_cb, qpair);
+ 
+ 	if (rc != 0) {
+@@ -1758,6 +1921,16 @@
+ 		}
+ 	}
+ 	if (mode_d && (inv & INV_F_TRFREE)) {
++		if (pqpair->inv_gring_on) {
++			/* inv 29-l5-gring: the poll group consumed the shared ring before this poll;
++			 * return what it credited to this qpair (the stock tail then counts it and
++			 * nvme_qpair_resubmit_requests sees it). The qpair's own record ring is never
++			 * read. */
++			uint32_t n = pqpair->inv_gring_done;
++
++			pqpair->inv_gring_done = 0;
++			return n;
++		}
+ 		if (inv & INV_F_REC16) {
+ 			return inv_records_trfree(pqpair, max_completions, 2, false);
+ 		}
+@@ -2157,6 +2330,9 @@
+ 	if (nvme_qpair_is_admin_queue(qpair)) {
+ 		nvme_pcie_admin_qpair_destroy(qpair);
+ 	}
++	if (pqpair->inv_gring != NULL) {
++		inv_gring_leave(pqpair);	/* inv 29: safety net; poll-group remove normally left */
++	}
+ 	if (pqpair->inv_flags & INV_F_TRFREE) {
+ 		/* inv 20-l1-trfree: the §4 L evidence. Every cid back on the stack and no extra
+ 		 * push = every trfree IO submitted was completed exactly once. */
+@@ -3382,9 +3558,153 @@
+ 	struct nvme_pcie_qpair *pqpair = nvme_pcie_qpair(qpair);
+ 
+ 	pqpair->stat = &g_dummy_stat;
++	if (pqpair->inv_gring != NULL) {
++		inv_gring_leave(pqpair);	/* inv 29-l5-gring */
++	}
+ 	return 0;
+ }
+ 
++/* inv 29-l5-gring: consume the poll group's shared ring in ring order, at most budget records.
++ * The record is 20's trfree record, the LOCKED 32 B layout: w0 = req (echo of descriptor w4),
++ * w1 = cb_arg, w2/w3 = cpl with the ring phase at w3 bit 48, read like inv_rec_pop (w3 first).
++ * req->qpair names the member: its cid goes back on that qpair's 20 stack, its queue_depth drops
++ * and the completion is credited to it (inv_gring_done, returned by its own poll right after),
++ * then the callback runs and req is freed, the order of inv_records_trfree. */
++static inline __attribute__((always_inline)) uint32_t
++inv_gring_consume(struct inv_gring *g, uint32_t budget)
++{
++	uint32_t n = 0;
++
++	while (n < budget) {
++		volatile uint64_t *recw = (volatile uint64_t *)g->ring + (size_t)g->head * 4;
++		uint64_t hi = recw[3];
++		uint64_t req_w, cb_arg, cpl_lo;
++		struct nvme_request *req;
++		struct nvme_pcie_qpair *pq;
++		struct spdk_nvme_cpl cpl_rec;
++		uint16_t cid;
++
++		if (((uint8_t)((hi >> 48) & 0x1u)) != g->phase) {
++			break;
++		}
++		req_w = recw[0];
++		cb_arg = recw[1];
++		cpl_lo = recw[2];
++		if (spdk_unlikely(++g->head == g->entries)) {
++			g->head = 0;
++			g->phase = !g->phase;
++		}
++		req = (struct nvme_request *)(uintptr_t)req_w;
++		pq = nvme_pcie_qpair(req->qpair);
++		cid = (uint16_t)((hi >> 32) & 0xFFFFu);
++		memcpy((uint8_t *)&cpl_rec + 0, &cpl_lo, 8);
++		memcpy((uint8_t *)&cpl_rec + 8, &hi, 8);
++		assert(cid < pq->inv_cid_cap);
++		if (spdk_likely(pq->inv_cid_top < pq->inv_cid_cap)) {
++			pq->inv_cid_stack[pq->inv_cid_top++] = cid;
++		} else {
++			/* duplicate or bogus record: counted, reported by 20's destroy line */
++			pq->inv_cid_extra++;
++		}
++		pq->qpair.queue_depth--;
++		pq->inv_gring_done++;
++		req->cb_fn((void *)(uintptr_t)cb_arg, &cpl_rec);
++		nvme_free_request(req);
++		n++;
++	}
++	g->consumed += n;
++	return n;
++}
++
++/* inv 29-l5-gring, IAU_INV_GLOBAL_RING=2: true when spdk_nvme_qpair_process_completions() on this
++ * gring member would only count a poll: no credit from the group loop (so the transport poll would
++ * return 0 and nvme_qpair_resubmit_requests would not run), no pending batched SQ doorbell (the
++ * poll tail compares last_sq_desc_tail with sq_desc_tail on Mode D qpairs), no queued, aborting or
++ * error-injected request, no deferred delete, no vtophys failure, no timeout check, and a qpair
++ * that is ENABLED with no transport failure reason (nvme_qpair_check_enabled has no side effect
++ * then: it acts on a CONNECTED qpair, or disconnects an ENABLED one whose failure reason a reset
++ * set) on a live controller with a READY PCIe state (the transport's early returns are not taken). Skipping it leaves polls and
++ * idle_polls uncounted for that call and changes nothing else. */
++static inline __attribute__((always_inline)) bool
++inv_gring_idle(struct spdk_nvme_qpair *qpair)
++{
++	const struct nvme_pcie_qpair *pq = nvme_pcie_qpair(qpair);
++
++	return pq->inv_gring_on && pq->inv_gring_done == 0 &&
++	       pq->last_sq_desc_tail == pq->sq_desc_tail &&
++	       STAILQ_EMPTY(&qpair->queued_req) &&
++	       nvme_qpair_get_state(qpair) == NVME_QPAIR_ENABLED &&
++	       qpair->transport_failure_reason == SPDK_NVME_QPAIR_FAILURE_NONE &&
++	       pq->pcie_state == NVME_PCIE_QPAIR_READY &&
++	       !pq->flags.has_pending_vtophys_failures &&
++	       STAILQ_EMPTY(&qpair->aborting_queued_req) &&
++	       STAILQ_EMPTY(&qpair->err_req_head) &&
++	       !qpair->delete_after_completion_context &&
++	       !qpair->ctrlr->is_failed && !qpair->ctrlr->timeout_enabled;
++}
++
++/* inv 29-l5-gring: the stock poll-group body with the shared ring consumed once, between the
++ * disconnected-qpair callbacks and the per-qpair polls (which ring the batched SQ doorbells and
++ * resubmit queued requests; gring qpairs return their credit without reading their own ring).
++ * Budget = the stock per-call bound: the members' max_completions_cap, or completions_per_qpair
++ * per member when that is smaller. skip_idle (mode 2, a constant per instantiation) skips the
++ * per-qpair call of an idle member (inv_gring_idle); the return value stays the sum of credits. */
++static inline __attribute__((always_inline)) int64_t
++inv_gring_poll_body(struct spdk_nvme_transport_poll_group *tgroup, struct inv_gring *g,
++		    uint32_t completions_per_qpair, spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb,
++		    const bool skip_idle)
++{
++	struct spdk_nvme_qpair *qpair, *tmp_qpair;
++	int32_t local_completions = 0;
++	int64_t total_completions = 0;
++	uint32_t budget = g->budget;
++
++	STAILQ_FOREACH_SAFE(qpair, &tgroup->disconnected_qpairs, poll_group_stailq, tmp_qpair) {
++		disconnected_qpair_cb(qpair, tgroup->group->ctx);
++	}
++
++	if (completions_per_qpair != 0 && (uint64_t)completions_per_qpair * g->members < budget) {
++		budget = completions_per_qpair * g->members;
++	}
++	inv_gring_consume(g, budget);
++
++	STAILQ_FOREACH_SAFE(qpair, &tgroup->connected_qpairs, poll_group_stailq, tmp_qpair) {
++		if (skip_idle && inv_gring_idle(qpair)) {
++			continue;	/* mode 2: the per-qpair call would be a no-op */
++		}
++		local_completions = spdk_nvme_qpair_process_completions(qpair, completions_per_qpair);
++		if (spdk_unlikely(local_completions < 0)) {
++			disconnected_qpair_cb(qpair, tgroup->group->ctx);
++			total_completions = -ENXIO;
++		} else if (spdk_likely(total_completions >= 0)) {
++			total_completions += local_completions;
++		}
++	}
++
++	return total_completions;
++}
++
++static int64_t __attribute__((noinline, hot))
++inv_gring_poll_group(struct spdk_nvme_transport_poll_group *tgroup, uint32_t completions_per_qpair,
++		     spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb)
++{
++	struct inv_gring *g = &SPDK_CONTAINEROF(tgroup, struct nvme_pcie_poll_group, group)->inv_gring;
++
++	if (g->mode == 2) {
++		return inv_gring_poll_body(tgroup, g, completions_per_qpair, disconnected_qpair_cb, true);
++	}
++	return inv_gring_poll_body(tgroup, g, completions_per_qpair, disconnected_qpair_cb, false);
++}
++
++/* inv 29-l5-gring: cold one-jmp trampoline, as 20's inv_completions_trampoline, so GCC keeps the
++ * stock block layout of nvme_pcie_poll_group_process_completions. */
++static int64_t __attribute__((noinline, cold))
++inv_gring_poll_trampoline(struct spdk_nvme_transport_poll_group *tgroup,
++			  uint32_t completions_per_qpair, spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb)
++{
++	return inv_gring_poll_group(tgroup, completions_per_qpair, disconnected_qpair_cb);
++}
++
+ int64_t
+ nvme_pcie_poll_group_process_completions(struct spdk_nvme_transport_poll_group *tgroup,
+ 		uint32_t completions_per_qpair, spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb)
+@@ -3393,6 +3713,13 @@
+ 	int32_t local_completions = 0;
+ 	int64_t total_completions = 0;
+ 
++	/* inv 29-l5-gring: one predictable test of a poll-group field (ring is NULL unless a gring
++	 * qpair joined this group). */
++	if (spdk_unlikely(SPDK_CONTAINEROF(tgroup, struct nvme_pcie_poll_group,
++					   group)->inv_gring.ring != NULL)) {
++		return inv_gring_poll_trampoline(tgroup, completions_per_qpair, disconnected_qpair_cb);
++	}
++
+ 	STAILQ_FOREACH_SAFE(qpair, &tgroup->disconnected_qpairs, poll_group_stailq, tmp_qpair) {
+ 		disconnected_qpair_cb(qpair, tgroup->group->ctx);
+ 	}
+@@ -3421,13 +3748,29 @@
+ 	}
+ }
+ 
++/* inv 29-l5-gring: free the shared ring with its poll group (every member has left: the group is
++ * empty). The destroy line is the §4 L evidence that the ring carried the completions. */
++static void __attribute__((noinline, cold))
++inv_gring_free(struct inv_gring *g)
++{
++	fprintf(stderr, "INV_GRING ring=%p consumed=%" PRIu64 " members=%u at destroy\n",
++		(void *)g->ring, g->consumed, g->members);
++	spdk_free(g->ring);
++	g->ring = NULL;
++}
++
+ int
+ nvme_pcie_poll_group_destroy(struct spdk_nvme_transport_poll_group *tgroup)
+ {
++	struct nvme_pcie_poll_group *group = SPDK_CONTAINEROF(tgroup, struct nvme_pcie_poll_group, group);
++
+ 	if (!STAILQ_EMPTY(&tgroup->connected_qpairs) || !STAILQ_EMPTY(&tgroup->disconnected_qpairs)) {
+ 		return -EBUSY;
+ 	}
+ 
++	if (group->inv_gring.ring != NULL) {
++		inv_gring_free(&group->inv_gring);	/* inv 29-l5-gring */
++	}
+ 	free(tgroup);
+ 
+ 	return 0;
+diff -ruN a/lib/nvme/nvme_pcie_internal.h b/lib/nvme/nvme_pcie_internal.h
+--- a/lib/nvme/nvme_pcie_internal.h	2026-10-14 14:11:19.365908165 +0000
++++ b/lib/nvme/nvme_pcie_internal.h	2026-10-14 14:48:27.049979098 +0000
+@@ -294,9 +294,34 @@
+ SPDK_STATIC_ASSERT((offsetof(struct nvme_tracker, u.sgl) & 7) == 0, "SGL must be Qword aligned");
+ SPDK_STATIC_ASSERT((offsetof(struct nvme_tracker, meta_sgl) & 7) == 0, "SGL must be Qword aligned");
+ 
++/*
++ * inv 29-l5-gring (UNSAFE oracle, see the patch header): one Mode D record ring shared by every
++ * gring IO qpair of a poll group. The first member allocates it at connect, every member writes
++ * its IOVA to CQ_REC_RING_IOVA_OFFSET + 8 * qid on its own controller, and
++ * nvme_pcie_poll_group_process_completions() consumes it once per call. IAU_INV_GLOBAL_RING=1 keeps
++ * every member's per-qpair poll call; =2 skips the call for a member with nothing to do (no
++ * credit, no pending SQ doorbell, no queued or aborting work). Poll-group thread only.
++ */
++#define INV_GRING_ENTRIES_DEFAULT	4096
++#define INV_GRING_ENTRIES_MAX		65536	/* 2 MiB of 32 B records */
++
++struct inv_gring {
++	struct nvme_uncore_cq_cb_rec	*ring;		/* entries x LOCKED 32 B records; NULL = off */
++	uint64_t			bus_addr;	/* the IOVA every member registers */
++	uint64_t			consumed;	/* records consumed (destroy evidence) */
++	uint32_t			head;		/* consumer cursor */
++	uint32_t			entries;
++	uint32_t			members;	/* gring IO qpairs joined */
++	uint32_t			inflight_cap;	/* sum of the members' inv_gring_cap, <= entries */
++	uint32_t			budget;		/* sum of the members' max_completions_cap */
++	uint8_t				phase;		/* expected phase: 1 on the first pass, flips on wrap */
++	uint8_t				mode;		/* IAU_INV_GLOBAL_RING: 1 = per-qpair calls kept, 2 = idle ones skipped */
++};
++
+ struct nvme_pcie_poll_group {
+ 	struct spdk_nvme_transport_poll_group group;
+ 	struct spdk_nvme_pcie_stat stats;
++	struct inv_gring inv_gring;	/* inv 29: tail (calloc'd, ring NULL = stock path) */
+ };
+ 
+ enum nvme_pcie_qpair_state {
+@@ -503,6 +528,12 @@
+ 	uint8_t inv_addr_b;		/* inv 27: 1 = w2 is the data va, 2 = w2 is vtophys(va); 0 = off */
+ 	uint64_t inv_db_n;		/* inv 28: doorbell stores that spun (SQ and CQ) */
+ 	uint8_t inv_pf;			/* inv 30: 1 = software prefetch in the 32 B lever completion loops */
++	/* inv 29-l5-gring: inv_gring_on is set at construct (IAU_INV_GLOBAL_RING=1|2 on a trfree Mode D
++	 * IO qpair); inv_gring is the poll group's ring, set at connect (join), NULL after remove. */
++	uint8_t inv_gring_on;
++	uint32_t inv_gring_done;	/* completions the group loop credited since this qpair's last poll */
++	uint32_t inv_gring_cap;		/* in-flight bound: min(cid stack, io_queue_requests + 1) */
++	struct inv_gring *inv_gring;
+ };
+ 
+ /* inv 22-l2-thin: one read with no nvme_request and no tracker (UNSAFE oracle, see the patch
+diff -ruN a/lib/nvmf/vfio_user.c b/lib/nvmf/vfio_user.c
+--- a/lib/nvmf/vfio_user.c	2026-10-14 14:11:19.346594941 +0000
++++ b/lib/nvmf/vfio_user.c	2026-10-14 14:18:19.239898092 +0000
+@@ -1221,6 +1221,7 @@
+ 	iau_inv_rec_init();	/* inv 23-l3-rec: IAU_INV_REC_BYTES, read once at target init */
+ 	iau_inv_idle_init();	/* inv 24-l4-idleflush: IAU_INV_IDLE_FLUSH, read once at target init */
+ 	iau_inv_desc_init();	/* inv 25-l6-desc: IAU_INV_DESC_BYTES, read once at target init */
++	iau_inv_gring_init();	/* inv 29-l5-gring: IAU_INV_GLOBAL_RING(_ENTRIES), read once at target init */
+ 
+ 	if (opts->transport_specific != NULL &&
+ 	    spdk_json_decode_object_relaxed(opts->transport_specific, vfio_user_transport_opts_decoder,
+@@ -2156,11 +2157,16 @@
+ 				    ctrlr_id(ctrlr), qid, desc_iova, rec_iova);
+ 			err = -EINVAL;
+ 		} else {
++			uint64_t rec_len = (uint64_t)qsize * iau_inv_rec_bytes();	/* inv 23 */
++
++			if (spdk_unlikely(iau_inv_gring_on())) {
++				/* inv 29-l5-gring: rec_iova is the host poll group's shared ring */
++				rec_len = (uint64_t)iau_inv_gring_entries() * IAU_REC_BYTES;
++			}
+ 			desc_va = map_one(ctrlr->endpoint->vfu_ctx, desc_iova,
+ 					  (uint64_t)qsize * iau_inv_desc_bytes(),	/* inv 25 */
+ 					  sq->iau_sg_desc, &sq->iau_iov_desc, MAP_R);
+-			rec_va = map_one(ctrlr->endpoint->vfu_ctx, rec_iova,
+-					 (uint64_t)qsize * iau_inv_rec_bytes(),	/* inv 23 */
++			rec_va = map_one(ctrlr->endpoint->vfu_ctx, rec_iova, rec_len,
+ 					 sq->iau_sg_rec, &sq->iau_iov_rec, MAP_RW);
+ 			if (desc_va == NULL || rec_va == NULL) {
+ 				SPDK_ERRLOG("%s: IAU Mode D: failed to map rings of sqid:%u\n",
+@@ -2175,6 +2181,10 @@
+ 				err = -EFAULT;
+ 			} else {
+ 				err = iau_sq_attach(&ctrlr->iau, qid, qsize, desc_va, rec_va);
++				if (err == 0 && spdk_unlikely(iau_inv_gring_on())) {
++					/* inv 29-l5-gring: on failure the unwind below detaches (no ref held) */
++					err = iau_inv_gring_get(rec_iova, &ctrlr->iau.sq[qid].gring);
++				}
+ 			}
+ 		}
+ 		if (err != 0) {
+diff -ruN a/lib/nvmf/vfio_user_iau.c b/lib/nvmf/vfio_user_iau.c
+--- a/lib/nvmf/vfio_user_iau.c	2026-10-14 14:11:19.347205542 +0000
++++ b/lib/nvmf/vfio_user_iau.c	2026-10-14 14:48:07.323002581 +0000
+@@ -82,6 +82,116 @@
+ 	return ctx->uncore_page[(IAU_CQ_REC_RING_IOVA_OFFSET - IAU_BAR0_UNCORE_PAGE_OFFSET) / 8 + qid];
+ }
+ 
++/* inv 29-l5-gring: the shared-ring table (vfio_user_iau.h). g_iau_inv_gring and the entry count
++ * are set once at transport create (read-only afterwards); without that call (unit tests) the
++ * lever is off. The table is touched at SQ attach/detach only, under the lock; producers only
++ * fetch-add ctr and read entries of an entry they hold a reference on. */
++static bool g_iau_inv_gring;	/* static: iau_flush tests it with one rip-relative compare */
++static uint32_t g_iau_inv_gring_entries = IAU_INV_GRING_ENTRIES_DEFAULT;
++static bool g_iau_inv_gring_bad;	/* IAU_INV_GLOBAL_RING_ENTRIES outside 1..65536 */
++static struct iau_gring g_iau_gring[IAU_INV_GRING_MAX];
++static pthread_mutex_t g_iau_gring_lock = PTHREAD_MUTEX_INITIALIZER;
++
++void
++iau_inv_gring_init(void)
++{
++	const char *e = getenv("IAU_INV_GLOBAL_RING");
++	const char *n = getenv("IAU_INV_GLOBAL_RING_ENTRIES");
++	long long v;
++
++	/* the host's rule (inv_env_i64): unset or empty = default, else strtoll; 1 and 2 differ only on
++	 * the host (2 also skips idle per-qpair polls), the device behaves the same */
++	if (e != NULL && e[0] != '\0') {
++		v = strtoll(e, NULL, 10);
++		g_iau_inv_gring = v == 1 || v == 2;
++	} else {
++		g_iau_inv_gring = false;
++	}
++	g_iau_inv_gring_entries = IAU_INV_GRING_ENTRIES_DEFAULT;
++	g_iau_inv_gring_bad = false;
++	if (n != NULL && n[0] != '\0') {
++		v = strtoll(n, NULL, 10);
++		if (v >= 1 && v <= (long long)IAU_INV_GRING_ENTRIES_MAX) {
++			g_iau_inv_gring_entries = (uint32_t)v;
++		} else {
++			g_iau_inv_gring_bad = true;
++		}
++	}
++	if (g_iau_inv_gring && g_iau_inv_gring_bad) {
++		fprintf(stderr, "INV_GRING target error: IAU_INV_GLOBAL_RING_ENTRIES=%s is outside "
++			"1..%u, every Mode D SQ create fails\n", n, IAU_INV_GRING_ENTRIES_MAX);
++	}
++}
++
++bool
++iau_inv_gring_on(void)
++{
++	return g_iau_inv_gring;
++}
++
++uint32_t
++iau_inv_gring_entries(void)
++{
++	return g_iau_inv_gring_entries;
++}
++
++int
++iau_inv_gring_get(uint64_t iova, struct iau_gring **out)
++{
++	struct iau_gring *g = NULL, *free_slot = NULL;
++	uint32_t i;
++	int rc = 0;
++
++	*out = NULL;
++	if (g_iau_inv_gring_bad || iova == 0) {
++		return -EINVAL;
++	}
++	if (iau_inv_rec_bytes() != IAU_REC_BYTES) {
++		fprintf(stderr, "INV_GRING target error: the shared ring needs 32 B records "
++			"(IAU_INV_REC_BYTES gives %u)\n", iau_inv_rec_bytes());
++		return -ENOTSUP;
++	}
++	pthread_mutex_lock(&g_iau_gring_lock);
++	for (i = 0; i < IAU_INV_GRING_MAX; i++) {
++		if (g_iau_gring[i].refs != 0 && g_iau_gring[i].iova == iova) {
++			g = &g_iau_gring[i];
++			break;
++		}
++		if (g_iau_gring[i].refs == 0 && free_slot == NULL) {
++			free_slot = &g_iau_gring[i];
++		}
++	}
++	if (g == NULL && free_slot != NULL) {
++		/* A new ring (the host allocates it zeroed, phase 0 = empty): ordinals restart at 0. */
++		g = free_slot;
++		g->iova = iova;
++		g->entries = g_iau_inv_gring_entries;
++		__atomic_store_n(&g->ctr, 0, __ATOMIC_RELAXED);
++		/* Stable format, parsed by scripts/realcore/inv/check_l.py (host ring IOVA and entries). */
++		fprintf(stderr, "INV_GRING target: iova=0x%" PRIx64 " entries=%u\n", iova, g->entries);
++	}
++	if (g != NULL) {
++		g->refs++;
++		*out = g;
++	} else {
++		fprintf(stderr, "INV_GRING target error: more than %u shared rings\n", IAU_INV_GRING_MAX);
++		rc = -ENOSPC;
++	}
++	pthread_mutex_unlock(&g_iau_gring_lock);
++	return rc;
++}
++
++static void
++iau_inv_gring_put(struct iau_gring *g)
++{
++	pthread_mutex_lock(&g_iau_gring_lock);
++	assert(g->refs > 0);
++	if (--g->refs == 0) {
++		g->iova = 0;
++	}
++	pthread_mutex_unlock(&g_iau_gring_lock);
++}
++
+ int
+ iau_sq_attach(struct iau_ctx *ctx, uint16_t qid, uint32_t entries,
+ 	      const volatile void *desc_ring, volatile void *rec_ring)
+@@ -117,6 +227,9 @@
+ 		return;
+ 	}
+ 	sq = &ctx->sq[qid];
++	if (sq->gring != NULL) {
++		iau_inv_gring_put(sq->gring);	/* inv 29-l5-gring */
++	}
+ 	free(sq->staging);
+ 	memset(sq, 0, sizeof(*sq));
+ }
+@@ -323,6 +436,51 @@
+ 	}
+ }
+ 
++/* inv 29-l5-gring: publish every staged completion into the shared ring. One fetch-add reserves
++ * staged consecutive ordinals; ordinal k is slot k % entries with phase 1 ^ ((k / entries) & 1),
++ * advanced per record like the per-SQ cursor. The host never sees a slot overwritten before it
++ * consumed it: every unconsumed ordinal is an in-flight IO of the host poll group, whose bound the
++ * host keeps at most entries at join. Out of line (noipa, the same signature as
++ * iau_inv_flush_sized) so iau_flush keeps its loop. */
++static void __attribute__((noipa))
++iau_inv_flush_gring(struct iau_ctx *ctx, struct iau_sq *sq)
++{
++	struct iau_gring *g = sq->gring;
++	uint32_t i, n = sq->staged, slot;
++	uint64_t ord;
++	uint8_t phase;
++
++	(void)ctx;
++	if (n == 0) {
++		return;
++	}
++	assert(g != NULL);
++	ord = __atomic_fetch_add(&g->ctr, n, __ATOMIC_RELAXED);
++	slot = (uint32_t)(ord % g->entries);
++	phase = (uint8_t)(1u ^ ((ord / g->entries) & 1u));
++	for (i = 0; i < n; i++) {
++		const struct iau_staged *st = &sq->staging[i];
++		volatile uint64_t *dst = &sq->rec_ring[(size_t)slot * 4];
++		uint8_t rec[IAU_REC_BYTES];
++		uint64_t w[4];
++
++		iau_pack_moded_record(st->cb_fn, st->cb_arg, st->cpl_lo, st->cpl_hi_raw, phase, rec);
++		memcpy(w, rec, sizeof(w));
++		dst[0] = w[0];
++		dst[1] = w[1];
++		dst[2] = w[2];
++		spdk_wmb();	/* payload visible before the phase word the host polls */
++		dst[3] = w[3];
++		if (++slot == g->entries) {
++			slot = 0;
++			phase ^= 1;
++		}
++		sq->credits_in_use--;	/* RTL credit_inc: one slot returned per emitted record */
++		sq->emitted++;
++	}
++	sq->staged = 0;
++}
++
+ void
+ iau_flush(struct iau_ctx *ctx, uint16_t qid)
+ {
+@@ -333,6 +491,10 @@
+ 		iau_inv_flush_sized(ctx, sq);	/* inv 23: 16 B or 64 B records (a tail call) */
+ 		return;
+ 	}
++	if (spdk_unlikely(g_iau_inv_gring)) {
++		iau_inv_flush_gring(ctx, sq);	/* inv 29: the shared ring (a tail call) */
++		return;
++	}
+ 	for (i = 0; i < sq->staged; i++) {
+ 		const struct iau_staged *st = &sq->staging[i];
+ 		volatile uint64_t *dst = &sq->rec_ring[(size_t)sq->rec_tail * 4];
+diff -ruN a/lib/nvmf/vfio_user_iau.h b/lib/nvmf/vfio_user_iau.h
+--- a/lib/nvmf/vfio_user_iau.h	2026-10-14 14:11:19.347367654 +0000
++++ b/lib/nvmf/vfio_user_iau.h	2026-10-14 14:48:07.323128189 +0000
+@@ -47,6 +47,8 @@
+ 
+ #define IAU_SQ_ALIGN 128u	/* two 64 B lines: per-SQ state is private to one device thread */
+ 
++struct iau_gring;	/* inv 29-l5-gring: a shared record ring (below) */
++
+ struct __attribute__((aligned(IAU_SQ_ALIGN))) iau_sq {
+ 	bool				active;
+ 	uint32_t			entries;	/* SQ size == descriptor ring == record ring */
+@@ -64,6 +66,7 @@
+ 	uint64_t			flush_by_n;
+ 	uint64_t			flush_by_t;
+ 	uint64_t			flush_by_idle;	/* inv 24-l4: flushes taken because nothing was in flight */
++	struct iau_gring		*gring;		/* inv 29-l5: shared record ring; NULL = rec_ring is per SQ */
+ };
+ SPDK_STATIC_ASSERT(sizeof(struct iau_sq) % IAU_SQ_ALIGN == 0, "iau_sq must be a multiple of IAU_SQ_ALIGN");
+ 
+@@ -155,4 +158,38 @@
+ void iau_inv_desc_init(void);
+ uint32_t iau_inv_desc_bytes(void);	/* inv 25: IAU_INV_DESC_BYTES = 32|40|64, default 40 */
+ 
++/*
++ * inv 29-l5-gring: investigation overlay oracle (UNSAFE), NOT the LOCKED RTL/gem5 design.
++ * IAU_INV_GLOBAL_RING=1 or 2 (strtoll, the host's rule; the device side is the same for both,
++ * 2 only changes host polling): the record ring of every Mode D SQ is a
++ * ring of IAU_INV_GLOBAL_RING_ENTRIES (default 4096, 1..65536) LOCKED 32 B records shared by every
++ * SQ whose host qpair sits in one host poll group (the host registers the same IOVA for all of
++ * them). Slots are reserved with one atomic fetch-add per flush on a process-wide producer counter
++ * keyed by the ring IOVA (a table of IAU_INV_GRING_MAX rings, an entry created by the first SQ
++ * that attaches the IOVA and released by the last one that detaches it): ordinal k goes to slot
++ * k % entries with phase 1 ^ ((k / entries) & 1), so the first pass writes phase 1 like the
++ * per-SQ ring; w0..w2, spdk_wmb(), then w3. Producers on different device threads can publish
++ * ordinal k + 1 before k: the host consumes in order and waits for k (acceptable for a bound).
++ * The SQ maps entries x 32 B at the IOVA. Read once at transport create; one
++ * "INV_GRING target: iova=0x... entries=E" line on stderr per ring (check_l.py).
++ */
++#define IAU_INV_GRING_MAX		64u
++#define IAU_INV_GRING_ENTRIES_DEFAULT	4096u
++#define IAU_INV_GRING_ENTRIES_MAX	65536u
++
++struct __attribute__((aligned(64))) iau_gring {
++	uint64_t	ctr;		/* next record ordinal (atomic fetch-add by every producer) */
++	uint64_t	iova;		/* host IOVA of the ring (the table key) */
++	uint32_t	entries;
++	uint32_t	refs;		/* attached SQs; 0 = free table slot */
++};
++
++void iau_inv_gring_init(void);
++bool iau_inv_gring_on(void);		/* IAU_INV_GLOBAL_RING=1|2 at transport create */
++uint32_t iau_inv_gring_entries(void);
++/* Take a reference on the ring at iova (creating its table entry on first use). 0, -EINVAL
++ * (bad IAU_INV_GLOBAL_RING_ENTRIES or iova 0), -ENOTSUP (record size other than 32 B) or
++ * -ENOSPC (table full). The reference is dropped by iau_sq_detach() through sq->gring. */
++int iau_inv_gring_get(uint64_t iova, struct iau_gring **out);
++
+ #endif

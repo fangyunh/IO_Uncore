@@ -1,0 +1,18 @@
+# inv-patch: 13-iport
+# purpose: I-port — Mode D host path without port defects; the only defect found in the residue audit (class A, hot in Mode 4) is the per-IO 32-bit integer divide in the Mode D submit branch, sq_desc_tail=(idx+1) % num_entries, replaced by a compare-and-wrap; every other class-A row is design semantics and is kept (outstanding_tr bookkeeping, abort and teardown stay)
+# safety: SAFE
+# breaks: none
+# env: none
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff,12-residue.diff
+diff -ruN a/lib/nvme/nvme_pcie_common.c b/lib/nvme/nvme_pcie_common.c
+--- a/lib/nvme/nvme_pcie_common.c	2026-10-13 22:27:20.189067044 +0000
++++ b/lib/nvme/nvme_pcie_common.c	2026-10-13 22:27:27.943169849 +0000
+@@ -2095,7 +2095,7 @@
+ 		req->t_poll_start = pqpair->poll_cycle_accum;
+ #endif
+ 
+-		pqpair->sq_desc_tail = (uint32_t)((_idx + 1) % pqpair->num_entries);
++		pqpair->sq_desc_tail = (_idx + 1 == pqpair->num_entries) ? 0 : _idx + 1;
+ 		if (!pqpair->flags.delay_cmd_submit) {
+ 			nvme_pcie_qpair_ring_sq_doorbell(qpair);
+ 			pqpair->last_sq_desc_tail = pqpair->sq_desc_tail;

@@ -1,0 +1,6 @@
+# inv-patch: 15-pure-m0
+# purpose: B-stock-pure: vanilla Mode 0 reference (Mode D dispatch compiled out); Mode 4 does NOT work in this variant
+# safety: SAFE
+# breaks: Mode D/C/E unusable
+# env: none
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff,12-residue.diff,13-iport.diff,14-stathist.diff

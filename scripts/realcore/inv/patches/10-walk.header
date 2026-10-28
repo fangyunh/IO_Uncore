@@ -1,0 +1,6 @@
+# inv-patch: 10-walk
+# purpose: compile out the O(QD) outstanding_tr walk in nvme_pcie_qpair_mark_doorbell_time under SPDK_NVME_IO_CYCLE_OFF (probe-only; t_sqe_copy is always 0 in lean)
+# safety: SAFE
+# breaks: none (instrumentation only)
+# env: none
+# base: 00-spin.diff,01-floor.diff

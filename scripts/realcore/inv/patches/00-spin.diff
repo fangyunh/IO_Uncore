@@ -1,0 +1,83 @@
+# inv-patch: 00-spin
+# purpose: calibrated serialized busy loop per IO for the CPU-bound host-slope test (spec §4 H)
+# safety: SAFE
+# breaks: none
+# env: SPDK_INV_SPIN_NS=<ns> (TSC-timed busy-wait, the spec §4 H instrument) or SPDK_INV_SPIN_CYCLES=<iterations> (lfence-serialized add loop, diagnostic); default 0 = off
+# base: none
+diff -ruN a/app/spdk_nvme_perf/perf.c b/app/spdk_nvme_perf/perf.c
+--- a/app/spdk_nvme_perf/perf.c	2026-10-13 23:29:37.602810658 +0000
++++ b/app/spdk_nvme_perf/perf.c	2026-10-13 23:29:37.628702331 +0000
+@@ -1731,6 +1731,63 @@
+ 	g_compute_ops += (uint64_t)g_compute_per_io;
+ }
+ 
++/* inv 00-spin: per-IO busy work for the host-slope test (spec §4 H).
++ * SPDK_INV_SPIN_NS=<ns>: TSC-timed busy-wait (the calibrated instrument, no serialization).
++ * SPDK_INV_SPIN_CYCLES=<n>: lfence-serialized add loop (diagnostic).
++ * Parsed once at startup; the off path in task_complete is one load + one not-taken branch. */
++static uint64_t g_inv_spin_iters;
++static uint64_t g_inv_spin_ns;
++static uint64_t g_inv_spin_ticks;
++static uint64_t g_inv_spin_on;
++
++static void __attribute__((constructor))
++inv_spin_init(void)
++{
++	const char *e = getenv("SPDK_INV_SPIN_CYCLES");
++	const char *n = getenv("SPDK_INV_SPIN_NS");
++	long long v = (e != NULL) ? strtoll(e, NULL, 10) : 0;
++	long long w = (n != NULL) ? strtoll(n, NULL, 10) : 0;
++
++	g_inv_spin_iters = (v > 0) ? (uint64_t)v : 0;
++	g_inv_spin_ns = (w > 0) ? (uint64_t)w : 0;
++	g_inv_spin_on = g_inv_spin_iters | g_inv_spin_ns;
++}
++
++static void __attribute__((noinline, cold))
++inv_spin_cycles(void)
++{
++	uint64_t i, x = 0;
++
++	__asm__ volatile("lfence" ::: "memory");
++	for (i = 0; i < g_inv_spin_iters; i++) {
++		__asm__ volatile("add $1, %0" : "+r"(x));
++	}
++	__asm__ volatile("lfence" ::: "memory");
++}
++
++static void __attribute__((noinline, cold))
++inv_spin_ns(void)
++{
++	uint64_t t0;
++
++	if (g_inv_spin_ticks == 0) {
++		g_inv_spin_ticks = g_inv_spin_ns * spdk_get_ticks_hz() / 1000000000ULL;
++	}
++	t0 = spdk_get_ticks();
++	while (spdk_get_ticks() - t0 < g_inv_spin_ticks) {
++	}
++}
++
++static void __attribute__((noinline, cold))
++inv_spin(void)
++{
++	if (g_inv_spin_ns != 0) {
++		inv_spin_ns();
++	} else {
++		inv_spin_cycles();
++	}
++}
++
+ static inline void
+ task_complete(struct perf_task *task)
+ {
+@@ -1773,6 +1830,9 @@
+ 	} else {
+ 		/* Co-resident compute: process the fetched node before the next hop. */
+ 		ann_compute_kernel(task);
++		if (spdk_unlikely(g_inv_spin_on != 0)) {
++			inv_spin();
++		}
+ 		submit_single_io(task);
+ 	}
+ }

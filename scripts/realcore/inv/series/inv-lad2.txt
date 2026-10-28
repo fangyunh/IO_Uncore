@@ -1,0 +1,4 @@
+00-spin.diff
+01-floor.diff
+10-walk.diff
+11-deadstores.diff

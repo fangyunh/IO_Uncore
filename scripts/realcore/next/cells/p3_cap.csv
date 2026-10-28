@@ -1,0 +1,3 @@
+cell_id,app_cpus,dev_cpus,qd,qpairs,controllers,compute,lat,placement,env,workload,rwmix,io_size,engine_cpus
+cap,0,4+5,128,2,1,0,1,same-socket,IAU_DEV_CHANNELS=8;IAU_DEV_TMAX=125000,randread,100,4096,
+ovr,0,4+5,128,1,2,0,1,same-socket,IAU_DEV_CHANNELS=8;IAU_DEV_TMAX=125000;IAU_DEV_TMAX_C1=62500;SPDK_PERF_WORKER_GROUP=1,randread,100,4096,

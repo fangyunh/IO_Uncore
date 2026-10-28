@@ -1,0 +1,179 @@
+# inv-patch: 30-l10-pf
+# purpose: L10 software prefetch in the Mode D lever completion loops (spec I3 follow-up). The I3 profile of the Mode D completion path on a 1-core cell showed a dependent miss chain: device-written 32 B record in the host ring -> tr = &pqpair->tr[cid] (nvme_tracker is 4096 B, so every tracker header maps to one L1 set) -> tr->req -> callback -> nvme_free_request(req) (touches req->stailq and req->qpair, offsets 0x90/0x98). Stock upstream SPDK hides the equivalent misses in the mode-0 CQ loop (nvme_pcie_qpair_process_completions) with two software prefetches: (a) when the NEXT CQE is already valid, __builtin_prefetch(&pqpair->tr[next_cpl->cid]); (b) before completing the current tracker, __builtin_prefetch(&tr->req->stailq). The Mode D loops have neither. This overlay adds them and measures how much of the IAU completion cost a plain prefetch recovers. Env SPDK_INV_PF=1 (default off, read once at load by inv_env_prime()). New tail byte inv_pf (after inv_db_n; NOT an inv_flags bit, all eight are taken, and a bit would divert the stock poll). inv_process_completions branches once per poll on inv_pf to a separate instantiation of the always_inline loops with a const pf parameter (existing call sites pass false). pf in inv_records_tr (mirrors upstream): after the pop, peek the next record's phase word w3 at the already-advanced cq_rec_head/cq_rec_phase (volatile load, same bit test as inv_rec_pop, wrap already handled by the pop); if valid, prefetch &pqpair->tr[next_cid]; then before the callback prefetch &req->stailq. pf in inv_records_trfree: the same peek reads two words of the next record, w3 (phase) and, if valid, w0 (the next req pointer), and prefetches only &next_req->stailq (cb_fn, cb_arg, stailq and qpair share that line in the lean layout; line 0 is only used by the next allocation's memset, so it is left alone as upstream does); no extra prefetch before the current callback, req came from the record. Both loops guard the peek with words == 4. The peek never consumes or modifies ring state. Set at the end of IO qpair construct, on Mode D (not Mode E, not mode 0) IO qpairs only, and only when the final inv_flags routes completions to inv_records_tr or inv_records_trfree with words == 4 (TRFREE without REC16/REC64, or any of REC32/DESC/ADDR without REC16/REC64 and without THIN; loop=trfree iff the TRFREE bit survives, else tr). Otherwise inv_pf stays 0 and one process-wide line "INV_PF ignored: needs a 32 B lever completion loop (set IAU_INV_REC_BYTES=32 or SPDK_INV_TRFREE=1)" is printed, only for Mode D IO qpairs that have a record ring (silent in mode 0 and Mode E). SPDK_INV_PF alone sets no inv_flags bit, so the stock paths run and the knob is ignored. Matched controls: IAU_INV_REC_BYTES=32;SPDK_INV_PF=1 versus IAU_INV_REC_BYTES=32 (tracker loop), SPDK_INV_TRFREE=1;SPDK_INV_PF=1 versus SPDK_INV_TRFREE=1 (trfree loop), IAU_INV_DESC_BYTES=40;SPDK_INV_PF=1 versus IAU_INV_DESC_BYTES=40. Composes with 25 and 27 (they pick the tracker loop at 32 B records) and with 28. Guard (also in this patch): at the end of IO qpair construct every IO qpair whose final inv_flags is nonzero prints "INV_FLAGS qid=N flags=0x%02x" whichever lever set the bits; check_l.py FAILs a point whose lines differ from the flags computed from the lever envs (an unexpected bit would divert the stock paths, the 25 unset-env bug). Build note: with the knob unset the stock nvme_pcie_qpair_submit_request and nvme_pcie_qpair_process_completions are instruction-identical to the same chain without 30 except __LINE__ immediates, but inv_process_completions is re-laid-out by this patch, so every lever arm and its control must come from the same (rebuilt) inv-levers binary. The PF delta includes the early read of the next record line while the device may still be writing it (the same as upstream's next-CQE peek).
+# safety: SAFE (prefetch hints only; no queue, record, tracker or ring state changes, and a prefetch of a bad address cannot fault)
+# breaks: none (a peek reads ring words that the next pop would read anyway; the extra prefetches can only change timing; the INV_FLAGS line is evidence only). Only the 32 B loops are covered, so 16 B and 64 B records and the thin loops ignore the knob with the INV_PF ignored line. The trfree arm prefetches a req pointer taken from a device-written record, which a corrupt record could make arbitrary, but a prefetch never faults. §4 L evidence: host "INV_PF qid=N loop=tr|trfree" per Mode D IO qpair at construct when the knob took effect (no destroy line, the knob changes no state), and "INV_FLAGS qid=N flags=0x%02x" per IO qpair with nonzero inv_flags; check_l.py expects INV_PF when SPDK_INV_PF=1, mode 4, not THIN, REC bytes not 16/64 and (REC bytes 32, TRFREE, ADDR va|vtophys or DESC bytes 32|40|64), and FAILs unless the INV_FLAGS lines match the flags computed from the lever envs exactly (none when no bit is expected, else one per IO qpair with that value)
+# env: SPDK_INV_PF=1 (default 0; takes effect only on top of a 32 B lever completion loop: IAU_INV_REC_BYTES=32, SPDK_INV_TRFREE=1, SPDK_INV_ADDR=va|vtophys or IAU_INV_DESC_BYTES=32|40|64; alone it is ignored)
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff,12-residue.diff,13-iport.diff,14-stathist.diff,20-l1-trfree.diff,22-l2-thin.diff,23-l3-rec.diff,24-l4-idleflush.diff,25-l6-desc.diff,26-l7-app.diff,27-l9-addr.diff,28-s4-dbspin.diff
+diff -ruN a/lib/nvme/nvme_pcie_common.c b/lib/nvme/nvme_pcie_common.c
+--- a/lib/nvme/nvme_pcie_common.c	2026-10-14 07:25:47.932517482 +0000
++++ b/lib/nvme/nvme_pcie_common.c	2026-10-14 07:25:55.614362850 +0000
+@@ -138,6 +138,7 @@
+ 	return g_inv_rec_env_set == 1;
+ }
+ 
++static int64_t g_inv_pf = -1;		/* SPDK_INV_PF (strtoll); default 0 */
+ static int64_t g_inv_db_spin_ns = -1;	/* SPDK_INV_DB_SPIN_NS (strtoll); default 0 */
+ static int64_t g_inv_db_spin_cycles = -1;	/* SPDK_INV_DB_SPIN_CYCLES (strtoll); default 0 */
+ static uint64_t g_inv_db_ticks;	/* TSC ticks per spin (ns knob), set at construct; 0 = no ns spin */
+@@ -180,6 +181,7 @@
+ 	(void)inv_addr_mode();
+ 	inv_env_i64("SPDK_INV_DB_SPIN_NS", &g_inv_db_spin_ns, 0);
+ 	inv_env_i64("SPDK_INV_DB_SPIN_CYCLES", &g_inv_db_spin_cycles, 0);
++	inv_env_i64("SPDK_INV_PF", &g_inv_pf, 0);
+ }
+ 
+ SPDK_STATIC_ASSERT(sizeof(struct nvme_uncore_cq_cb_rec) == 32, "LOCKED Mode D record is 32 B");
+@@ -789,6 +791,38 @@
+ 		}
+ 	}
+ 
++	/* inv 30-l10-pf: software prefetch in the 32 B lever completion loops. Own byte (inv_pf),
++	 * not an inv_flags bit. Set last, once inv_flags is final: only a Mode D IO qpair whose
++	 * completions run in inv_records_tr or inv_records_trfree with words == 4 qualifies. */
++	pqpair->inv_pf = 0;
++	if (qpair->id != 0 && uncore_mode_d() && !uncore_mode_e() && pqpair->cq_rec_ring != NULL &&
++	    inv_env_i64("SPDK_INV_PF", &g_inv_pf, 0) == 1) {
++		uint8_t f = pqpair->inv_flags;
++		bool words4 = !(f & (INV_F_THIN | INV_F_REC16 | INV_F_REC64)) &&
++			      (f & (INV_F_TRFREE | INV_F_REC32 | INV_F_DESC | INV_F_ADDR));
++
++		if (words4) {
++			pqpair->inv_pf = 1;
++			fprintf(stderr, "INV_PF qid=%u loop=%s\n", qpair->id,
++				(f & INV_F_TRFREE) ? "trfree" : "tr");
++		} else {
++			static bool inv_pf_warned;
++
++			if (!inv_pf_warned) {
++				inv_pf_warned = true;
++				fprintf(stderr, "INV_PF ignored: needs a 32 B lever completion loop "
++					"(set IAU_INV_REC_BYTES=32 or SPDK_INV_TRFREE=1)\n");
++			}
++		}
++	}
++
++	/* inv 30-l10-pf guard: every IO qpair whose final inv_flags is nonzero says so, whichever
++	 * lever set the bits, so check_l.py can FAIL a point that has bits but no lever env (a
++	 * default that diverts the stock paths, like 25's old unset-env bug). */
++	if (qpair->id != 0 && pqpair->inv_flags != 0) {
++		fprintf(stderr, "INV_FLAGS qid=%u flags=0x%02x\n", qpair->id, pqpair->inv_flags);
++	}
++
+ 	nvme_pcie_qpair_reset(qpair);
+ 
+ 	return 0;
+@@ -1484,7 +1518,8 @@
+  * inv 23 (words == 2, 16 B records): the descriptor's w3 carries req, so the record's w0 (cb_arg)
+  * is req and the callback takes cb_fn and cb_arg from req. */
+ static inline __attribute__((always_inline)) uint32_t
+-inv_records_trfree(struct nvme_pcie_qpair *pqpair, uint32_t max_completions, const uint32_t words)
++inv_records_trfree(struct nvme_pcie_qpair *pqpair, uint32_t max_completions, const uint32_t words,
++		   const bool pf)
+ {
+ 	uint64_t rec_cb_fn, rec_cb_arg, cpl_lo, cpl_hi;
+ 	uint32_t num_completions = 0;
+@@ -1495,6 +1530,21 @@
+ 		uint16_t cid = (uint16_t)((cpl_hi >> 32) & 0xFFFFu);
+ 		struct spdk_nvme_cpl cpl_rec;
+ 
++		if (pf && words == 4) {
++			/* inv 30-l10-pf: peek the next record (cursor already advanced past the
++			 * current one, wrap handled by inv_rec_pop); if valid its w0 is the next req:
++			 * prefetch its stailq line (cb_fn, cb_arg, stailq and qpair share that line in the
++			 * lean layout; line 0 is only used by the next allocation's memset, so it is left
++			 * alone as upstream does). Nothing is consumed. */
++			volatile uint64_t *nw = (volatile uint64_t *)pqpair->cq_rec_ring +
++						(size_t)pqpair->cq_rec_head * words;
++
++			if (((uint8_t)((nw[3] >> 48) & 0x1u)) == pqpair->cq_rec_phase) {
++				struct nvme_request *nreq = (struct nvme_request *)(uintptr_t)nw[0];
++
++				__builtin_prefetch(&nreq->stailq);
++			}
++		}
+ 		memcpy((uint8_t *)&cpl_rec + 0, &cpl_lo, 8);
+ 		memcpy((uint8_t *)&cpl_rec + 8, &cpl_hi, 8);
+ 		assert(cid < pqpair->inv_cid_cap);
+@@ -1615,7 +1665,8 @@
+  * unchanged stock submit stores on the tracker line this loop already reads (tr->req), so the
+  * stock submit needs no lever code; the first completion registers it. */
+ static inline __attribute__((always_inline)) uint32_t
+-inv_records_tr(struct nvme_pcie_qpair *pqpair, uint32_t max_completions, const uint32_t words)
++inv_records_tr(struct nvme_pcie_qpair *pqpair, uint32_t max_completions, const uint32_t words,
++	       const bool pf)
+ {
+ 	uint64_t rec_cb_fn, rec_cb_arg, cpl_lo, cpl_hi;
+ 	uint32_t num_completions = 0;
+@@ -1623,10 +1674,27 @@
+ 	while (inv_rec_pop(pqpair, words, &rec_cb_fn, &rec_cb_arg, &cpl_lo, &cpl_hi)) {
+ 		struct nvme_tracker *tr = &pqpair->tr[(uint16_t)((cpl_hi >> 32) & 0xFFFFu)];
+ 
++		if (pf && words == 4) {
++			/* inv 30-l10-pf (upstream CQ-loop prefetch (a)): peek the next record (cursor
++			 * already advanced, wrap handled by inv_rec_pop); if valid, prefetch its
++			 * tracker. Nothing is consumed. */
++			volatile uint64_t *nw = (volatile uint64_t *)pqpair->cq_rec_ring +
++						(size_t)pqpair->cq_rec_head * words;
++			uint64_t nhi = nw[3];
++
++			if (((uint8_t)((nhi >> 48) & 0x1u)) == pqpair->cq_rec_phase) {
++				__builtin_prefetch(&pqpair->tr[(uint16_t)((nhi >> 32) & 0xFFFFu)]);
++			}
++		}
+ 		if (spdk_likely(tr->req != NULL)) {
+ 			struct nvme_request *req = tr->req;
+ 			struct spdk_nvme_cpl cpl_rec;
+ 
++			if (pf && words == 4) {
++				/* inv 30-l10-pf (upstream prefetch (b)): the line nvme_free_request touches. */
++				__builtin_prefetch(&req->stailq);
++			}
++
+ 			if (words == 2) {
+ 				if (spdk_unlikely(tr->cb_fn != pqpair->inv_cb_fn)) {
+ 					inv_rec16_register(pqpair, tr->cb_fn);
+@@ -1691,21 +1759,27 @@
+ 	}
+ 	if (mode_d && (inv & INV_F_TRFREE)) {
+ 		if (inv & INV_F_REC16) {
+-			return inv_records_trfree(pqpair, max_completions, 2);
++			return inv_records_trfree(pqpair, max_completions, 2, false);
+ 		}
+ 		if (inv & INV_F_REC64) {
+-			return inv_records_trfree(pqpair, max_completions, 8);
++			return inv_records_trfree(pqpair, max_completions, 8, false);
+ 		}
+-		return inv_records_trfree(pqpair, max_completions, 4);
++		if (pqpair->inv_pf) {
++			return inv_records_trfree(pqpair, max_completions, 4, true);	/* 30-l10-pf */
++		}
++		return inv_records_trfree(pqpair, max_completions, 4, false);
+ 	}
+ 	if (mode_d && (inv & (INV_F_REC16 | INV_F_REC32 | INV_F_REC64 | INV_F_DESC | INV_F_ADDR))) {
+ 		if (inv & INV_F_REC16) {
+-			return inv_records_tr(pqpair, max_completions, 2);
++			return inv_records_tr(pqpair, max_completions, 2, false);
+ 		}
+ 		if (inv & INV_F_REC64) {
+-			return inv_records_tr(pqpair, max_completions, 8);
++			return inv_records_tr(pqpair, max_completions, 8, false);
++		}
++		if (pqpair->inv_pf) {
++			return inv_records_tr(pqpair, max_completions, 4, true);	/* 30-l10-pf */
+ 		}
+-		return inv_records_tr(pqpair, max_completions, 4);	/* INV_F_REC32 control; 25: INV_F_DESC alone */
++		return inv_records_tr(pqpair, max_completions, 4, false);	/* INV_F_REC32 control; 25: INV_F_DESC alone */
+ 	}
+ 	inv_no_completion_path(pqpair, inv, mode_d);
+ 	return 0;
+diff -ruN a/lib/nvme/nvme_pcie_internal.h b/lib/nvme/nvme_pcie_internal.h
+--- a/lib/nvme/nvme_pcie_internal.h	2026-10-14 07:25:47.933160650 +0000
++++ b/lib/nvme/nvme_pcie_internal.h	2026-10-14 07:25:47.938682649 +0000
+@@ -502,6 +502,7 @@
+ 	uint8_t inv_desc_logged;	/* inv 25: bytes in this qpair's INV_DESC line; 0 = none */
+ 	uint8_t inv_addr_b;		/* inv 27: 1 = w2 is the data va, 2 = w2 is vtophys(va); 0 = off */
+ 	uint64_t inv_db_n;		/* inv 28: doorbell stores that spun (SQ and CQ) */
++	uint8_t inv_pf;			/* inv 30: 1 = software prefetch in the 32 B lever completion loops */
+ };
+ 
+ /* inv 22-l2-thin: one read with no nvme_request and no tracker (UNSAFE oracle, see the patch

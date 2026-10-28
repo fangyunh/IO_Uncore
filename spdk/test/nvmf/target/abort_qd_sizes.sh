@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+#  SPDX-License-Identifier: BSD-3-Clause
+#  Copyright (C) 2021 Intel Corporation
+#  All rights reserved.
+#
+
+testdir=$(readlink -f "$(dirname "$0")")
+rootdir=$(readlink -f "$testdir/../../../")
+
+# Set defaults we want to work with
+set -- "--transport=tcp" "--iso" "$@"
+
+source "$rootdir/test/common/autotest_common.sh"
+source "$rootdir/test/nvmf/common.sh"
+
+rabort() {
+	local trtype=$1
+	local adrfam=$2
+	local traddr=$3
+	local trsvcid=$4
+	local subnqn=$5
+
+	local qds qd
+	local target r
+
+	qds=(4 24 64)
+
+	for r in trtype adrfam traddr trsvcid subnqn; do
+		target=${target:+$target }$r:${!r}
+	done
+
+	for qd in "${qds[@]}"; do
+		run_app "$SPDK_EXAMPLE_DIR/abort" \
+			-q "$qd" \
+			-w rw \
+			-M 50 \
+			-o 4096 \
+			-r "$target"
+	done
+}
+
+spdk_target() {
+	local name=spdk_target bdev_name=spdk_target
+
+	nvme=$(get_first_nvme_bdf) || true
+	if [[ -z "$nvme" ]]; then
+		rpc_cmd bdev_malloc_create -b "$name" 64 512
+	else
+		rpc_cmd bdev_nvme_attach_controller -t pcie -a "$nvme" -b "$name"
+		bdev_name="${bdev_name}n1"
+	fi
+
+	rpc_cmd nvmf_create_transport $NVMF_TRANSPORT_OPTS -u 8192
+	rpc_cmd nvmf_create_subsystem "$NVME_SUBNQN" -a -s "$NVMF_SERIAL"
+	rpc_cmd nvmf_subsystem_add_ns "$NVME_SUBNQN" "${bdev_name}"
+	rpc_cmd nvmf_subsystem_add_listener "$NVME_SUBNQN" -t "$TEST_TRANSPORT" -a "$NVMF_FIRST_TARGET_IP" -s "$NVMF_PORT"
+
+	rabort "$TEST_TRANSPORT" IPv4 "$NVMF_FIRST_TARGET_IP" "$NVMF_PORT" "$NVME_SUBNQN"
+
+	rpc_cmd nvmf_delete_subsystem "$NVME_SUBNQN"
+	[[ -n "$nvme" ]] && rpc_cmd bdev_nvme_detach_controller "$name"
+
+	# Make sure we fully detached from the ctrl as vfio-pci won't be able to release the
+	# device otherwise - we can either wait a bit or simply kill the app. Since we don't
+	# really need it at this point, reap it but leave the net setup around. See:
+	# https://github.com/spdk/spdk/issues/2811
+	killprocess "$nvmfpid"
+}
+
+kernel_target() {
+	configure_kernel_target "$NVME_SUBNQN" "$(get_main_ns_ip)"
+	rabort "$TEST_TRANSPORT" IPv4 "$NVMF_INITIATOR_IP" "$NVMF_PORT" "$NVME_SUBNQN"
+	clean_kernel_target
+}
+
+nvmftestinit
+nvmfappstart -m 0xf
+
+trap 'process_shm --id $NVMF_APP_SHM_ID || :; nvmftestfini || :; clean_kernel_target' SIGINT SIGTERM EXIT
+
+run_test "spdk_target_abort" spdk_target
+if [[ "$SPDK_TEST_SKIP_NVMF_KERNEL_TESTS" -eq 0 ]]; then
+	run_test "kernel_target_abort" kernel_target
+fi
+
+trap - SIGINT SIGTERM EXIT
+nvmftestfini

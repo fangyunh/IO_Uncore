@@ -1,0 +1,6 @@
+# inv-patch: 11-deadstores
+# purpose: lean build drops the per-IO probe fields and every access (nvme_request back to the upstream 280 B layout; nvme_pcie_qpair probe fields removed)
+# safety: SAFE
+# breaks: none (lean build only drops probe fields and accesses)
+# env: none
+# base: 00-spin.diff,01-floor.diff,10-walk.diff

@@ -1,0 +1,43 @@
+# inv-patch: 19-nolist
+# purpose: outstanding_tr oracle — IO qpairs no longer track in-flight trackers on the outstanding_tr list (submit inserts and complete_tracker removes only for the admin queue, the Mode D completion loop drops its TAILQ_REMOVE), to bound the cost of the list maintenance
+# safety: UNSAFE
+# breaks: abort, timeout and teardown of in-flight IO on IO qpairs (both modes); on IO qpairs the list is always empty so nvme_pcie_qpair_abort_trackers (abort and qpair disable/destroy), nvme_pcie_qpair_check_timeout (timeout_cb_fn), nvme_pcie_qpair_process_completions bad-vtophys failure walk and nvme_pcie_qpair_mark_doorbell_time (non-lean build only) iterate nothing, so in-flight IOs are never aborted or timed out and a qpair torn down with IO in flight leaks them; admin queue (AER abort, admin timeouts) is unchanged; nvme_pcie.c:1224 (nvme_pcie_qpair_iterate_requests) likewise sees nothing on IO qpairs; queue_depth is still maintained; a tracker marked bad_vtophys on an IO qpair is never failed (the has_pending_vtophys_failures walk sees an empty list), so that IO would be stranded (cannot happen in a normal run)
+# env: none
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff,12-residue.diff,13-iport.diff
+diff -ruN a/lib/nvme/nvme_pcie_common.c b/lib/nvme/nvme_pcie_common.c
+--- a/lib/nvme/nvme_pcie_common.c	2026-10-13 22:27:28.093944628 +0000
++++ b/lib/nvme/nvme_pcie_common.c	2026-10-13 22:29:22.261628448 +0000
+@@ -913,7 +913,9 @@
+ 		req->retries++;
+ 		nvme_pcie_qpair_submit_tracker(qpair, tr);
+ 	} else {
+-		TAILQ_REMOVE(&pqpair->outstanding_tr, tr, tq_list);
++		if (qpair->id == 0) {	/* nolist: no outstanding list on IO qpairs (any mode) */
++			TAILQ_REMOVE(&pqpair->outstanding_tr, tr, tq_list);
++		}
+ 		pqpair->qpair.queue_depth--;
+ #ifndef SPDK_NVME_IO_CYCLE_OFF
+ 		req->t_dealloc_pre_end = nvme_io_cycle_rdtsc();
+@@ -1191,10 +1193,9 @@
+ #endif
+ 
+ 
+-				/* Lean recycle (v4.1): remove from outstanding + dec queue depth.
++				/* Lean recycle (v4.1): dec queue depth (nolist oracle: IO trackers are no longer tracked on outstanding_tr).
+ 				 * complete_tracker's status decode, retry/error branches, and cpl
+ 				 * synthesis are all offloaded/elided (device pre-decoded cpl). */
+-				TAILQ_REMOVE(&pqpair->outstanding_tr, tr, tq_list);
+ 				pqpair->qpair.queue_depth--;
+ #ifndef SPDK_NVME_IO_CYCLE_OFF
+ 				req->t_dealloc_pre_end = nvme_io_cycle_rdtsc();
+@@ -2041,7 +2042,9 @@
+ 
+ 	pqpair->stat->submitted_requests++;
+ 	TAILQ_REMOVE(&pqpair->free_tr, tr, tq_list); /* remove tr from free_tr */
+-	TAILQ_INSERT_TAIL(&pqpair->outstanding_tr, tr, tq_list);
++	if (qpair->id == 0) {	/* nolist: no outstanding list on IO qpairs (any mode) */
++		TAILQ_INSERT_TAIL(&pqpair->outstanding_tr, tr, tq_list);
++	}
+ 	pqpair->qpair.queue_depth++;
+ 	tr->req = req;
+ 	tr->cb_fn = req->cb_fn;

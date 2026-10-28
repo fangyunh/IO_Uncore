@@ -1,0 +1,9 @@
+arm_id,variant,tgt_variant,mode,env,trace
+bthin-m0,inv-levers,,0,SPDK_INV_THIN=1,
+bthin-m0-t2,inv-levers,,0,SPDK_INV_THIN=1;IAU_DEV_TMAX=500000,
+ithin-m4,inv-levers,,4,SPDK_INV_THIN=1,
+ithin-m4-t2,inv-levers,,4,SPDK_INV_THIN=1;IAU_DEV_TMAX=500000,
+combo-m4,inv-levers,,4,SPDK_INV_TRFREE=1,
+combo-m4-t2,inv-levers,,4,SPDK_INV_TRFREE=1;IAU_DEV_TMAX=500000,
+l1b-m4,inv-l1b,,4,,
+l1b-m4-t2,inv-l1b,,4,IAU_DEV_TMAX=500000,

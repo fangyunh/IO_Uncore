@@ -1,0 +1,44 @@
+# inv-patch: 21-l1b-stride
+# purpose: break the 4 KiB tracker stride that maps every tracker header to one L1 set (H5): NVME_MAX_PRP_LIST_ENTRIES 503 -> 511 makes struct nvme_tracker 4160 B (header 72 B + 511*8 B), and the tracker array is allocated 4096-aligned
+# safety: SAFE for 4 KiB IO (UNSAFE for multi-page IO)
+# breaks: a multi-page PRP list may cross a 4 KiB page (the PRP list lives inside the tracker at offset 72, tracker i starts at 4160*i), and the max transfer size from nvme_pcie_ctrlr_get_max_xfer_size grows from 503 to 511 pages; 4 KiB randread uses a single PRP entry and no list, so it is unaffected; a tracker may also straddle a 2 MiB hugepage boundary in IOVA space (irrelevant for 4 KiB IO)
+# env: none (compile-time)
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff,12-residue.diff,13-iport.diff
+diff -ruN a/lib/nvme/nvme_pcie_common.c b/lib/nvme/nvme_pcie_common.c
+--- a/lib/nvme/nvme_pcie_common.c	2026-10-13 23:36:43.775971415 +0000
++++ b/lib/nvme/nvme_pcie_common.c	2026-10-13 23:40:51.900376513 +0000
+@@ -400,8 +400,10 @@
+ 	 *   struct nvme_tracker must be padded so that its size is already a power of 2.
+ 	 *   This ensures the PRP list embedded in the nvme_tracker object will not span a
+ 	 *   4KB boundary, while allowing access to trackers in tr[] via normal array indexing.
++	 *   inv 21: no longer true, the stride is 4160 B and a PRP list may cross a page
++	 *   (4 KiB IO uses no list).
+ 	 */
+-	pqpair->tr = spdk_zmalloc(num_trackers * sizeof(*tr), sizeof(*tr), NULL,
++	pqpair->tr = spdk_zmalloc(num_trackers * sizeof(*tr), 4096, NULL,
+ 				  SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_SHARE | SPDK_MALLOC_DMA);
+ 	if (pqpair->tr == NULL) {
+ 		NVME_QPAIR_ERRLOG(qpair, "nvme_tr failed\n");
+diff -ruN a/lib/nvme/nvme_pcie_internal.h b/lib/nvme/nvme_pcie_internal.h
+--- a/lib/nvme/nvme_pcie_internal.h	2026-10-13 23:36:43.767163100 +0000
++++ b/lib/nvme/nvme_pcie_internal.h	2026-10-13 23:40:51.900782784 +0000
+@@ -19,7 +19,7 @@
+  */
+ #define NVME_MAX_SGL_DESCRIPTORS	(250)
+ 
+-#define NVME_MAX_PRP_LIST_ENTRIES	(503)
++#define NVME_MAX_PRP_LIST_ENTRIES	(511)	/* inv 21: tracker stride 4160 B */
+ 
+ /* Minimum admin queue size */
+ #define NVME_PCIE_MIN_ADMIN_QUEUE_SIZE	(256)
+@@ -289,8 +289,9 @@
+ /*
+  * struct nvme_tracker must be exactly 4K so that the prp[] array does not cross a page boundary
+  * and so that there is no padding required to meet alignment requirements.
++ * inv 21: the stride is now 4160 B, so a PRP list may cross a page (4 KiB IO uses no list).
+  */
+-SPDK_STATIC_ASSERT(sizeof(struct nvme_tracker) == 4096, "nvme_tracker is not 4K");
++SPDK_STATIC_ASSERT(sizeof(struct nvme_tracker) == 4160, "inv 21: nvme_tracker stride is 4160");
+ SPDK_STATIC_ASSERT((offsetof(struct nvme_tracker, u.sgl) & 7) == 0, "SGL must be Qword aligned");
+ SPDK_STATIC_ASSERT((offsetof(struct nvme_tracker, meta_sgl) & 7) == 0, "SGL must be Qword aligned");
+ 

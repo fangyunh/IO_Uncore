@@ -1,0 +1,770 @@
+# inv-patch: 12-residue
+# purpose: B-stock — the fork's Mode-0 hot path equals upstream SPDK's
+# safety: SAFE
+# breaks: Modes B, C, E and 2B no longer work in this variant (not under test); SPDK_UNCORE_MODE_C=1 without _D falls through to the standard path and SPDK_UNCORE_MODE_E=1 runs as Mode D
+# env: none
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff
+diff -ruN a/lib/nvme/nvme_pcie_common.c b/lib/nvme/nvme_pcie_common.c
+--- a/lib/nvme/nvme_pcie_common.c	2026-10-13 22:22:46.030313128 +0000
++++ b/lib/nvme/nvme_pcie_common.c	2026-10-13 22:26:30.715622971 +0000
+@@ -21,28 +21,6 @@
+ 
+ static struct spdk_nvme_pcie_stat g_dummy_stat = {};
+ 
+-/* IO-Uncore v2: env-gated, lazily-cached feature flag for the 16-byte
+- * compact SQE (2 MMIO writes instead of 3). */
+-static int g_uncore_sqe16 = -1;
+-static inline int uncore_sqe16(void) {
+-	if (spdk_unlikely(g_uncore_sqe16 < 0)) {
+-		const char *e = getenv("SPDK_UNCORE_SQE16");
+-		g_uncore_sqe16 = (e != NULL && e[0] == '1') ? 1 : 0;
+-	}
+-	return g_uncore_sqe16;
+-}
+-
+-/* IO-Uncore v2: env-gated, lazily-cached feature flag for multi-page
+- * mailbox transfers (raises the single-page fallback ceiling to 128 KiB). */
+-static int g_uncore_multipage = -1;
+-static inline int uncore_multipage(void) {
+-	if (spdk_unlikely(g_uncore_multipage < 0)) {
+-		const char *e = getenv("SPDK_UNCORE_MULTIPAGE");
+-		g_uncore_multipage = (e != NULL && e[0] == '1') ? 1 : 0;
+-	}
+-	return g_uncore_multipage;
+-}
+-
+ static void nvme_pcie_fail_request_bad_vtophys(struct spdk_nvme_qpair *qpair,
+ 		struct nvme_tracker *tr);
+ 
+@@ -93,7 +71,6 @@
+ 	/*
+ 	 * First time through the completion queue, HW will set phase
+ 	 *  bit on completions to 1.  So set this to 1 here, indicating
+-	uint64_t		 poll_start;
+ 	 *  we're looking for a 1 to know which entries have completed.
+ 	 *  we'll toggle the bit each time when the completion queue
+ 	 *  rolls over.
+@@ -850,7 +827,6 @@
+ 	struct nvme_request	*req;
+ 	struct nvme_pcie_qpair	*pqpair = nvme_pcie_qpair(qpair);
+ 	struct spdk_nvme_ctrlr	*ctrlr = qpair->ctrlr;
+-	struct nvme_pcie_ctrlr	*pctrlr;
+ 
+ 	req = tr->req;
+ 	assert(req != NULL);
+@@ -860,90 +836,6 @@
+ 			  req->cmd.cdw10, req->cmd.cdw11, req->cmd.cdw12,
+ 			  pqpair->qpair.queue_depth);
+ 
+-	/* IO-Uncore Mode 2B: compact mailbox submission path.  Skips the
+-	 * 64-byte SQE copy + standard doorbell ring when:
+-	 *   - mailbox is mapped (SPDK_UNCORE_MODE_B=1 + BAR0 large enough)
+-	 *   - this is an I/O qpair (qid > 0)
+-	 *   - the transfer fits in a single page (payload_size <= page_size)
+-	 *   - command is a single-page read or write
+-	 * The compact 24-byte descriptor is emitted as 3 sequential 8-byte
+-	 * MMIO writes to the per-qid mailbox slot.  Timestamps t_sqe_copy /
+-	 * t_cmd_end / t_doorbell / t_fence_end / t_db_end collapse to two
+-	 * rdtsc samples (around the 3 MMIO writes) to reflect the absence
+-	 * of those stages in instrumentation. */
+-	pctrlr = nvme_pcie_ctrlr(ctrlr);
+-	if (pctrlr->uncore_mailbox_base != NULL &&
+-	    qpair->id != 0 &&
+-	    req->payload_size <= (uncore_multipage() ? 131072u : ctrlr->page_size) &&
+-	    (req->cmd.opc == SPDK_NVME_OPC_READ ||
+-	     req->cmd.opc == SPDK_NVME_OPC_WRITE)) {
+-		uint64_t _w0, _w1, _w2;
+-		volatile uint64_t *_slot;
+-
+-		_slot = pctrlr->uncore_mailbox_base +
+-			(qpair->id * (MAILBOX_STRIDE_BYTES / sizeof(uint64_t)));
+-
+-#ifndef SPDK_NVME_IO_CYCLE_OFF
+-		req->t_sqe_copy = nvme_io_cycle_rdtsc();
+-#endif
+-		if (uncore_sqe16()) {
+-			/* v2 16-byte compact SQE: 2 MMIO writes.  gem5 expects
+-			 * nlb at w0[31:16] and control at w0[15:0]; cdw12 packs
+-			 * control<<16 | nlb, hence the swap below.  nsid is fixed
+-			 * to 1 and prp1_lo is dropped. */
+-			_w0 = ((uint64_t)(req->cmd.opc  & 0xFFu) << 56) |
+-			      ((uint64_t)(req->cmd.fuse & 0xFFu) << 48) |
+-			      ((uint64_t) req->cmd.cid           << 32) |
+-			      ((uint64_t)(req->cmd.cdw12 & 0xFFFFu) << 16) |
+-			      ((uint64_t)((req->cmd.cdw12 >> 16) & 0xFFFFu));
+-			_w1 = (uint64_t)req->cmd.cdw10 |
+-			      ((uint64_t)req->cmd.cdw11 << 32);
+-			g_thread_mmio_ctrlr = pctrlr;
+-			spdk_mmio_write_8(&_slot[0], _w0);
+-			spdk_mmio_write_8(&_slot[1], _w1);
+-			g_thread_mmio_ctrlr = NULL;
+-		} else {
+-			_w0 = ((uint64_t)(req->cmd.opc  & 0xFFu) << 56) |
+-			      ((uint64_t)(req->cmd.fuse & 0xFFu) << 48) |
+-			      ((uint64_t) req->cmd.cid           << 32) |
+-			      ((uint64_t) req->cmd.nsid                );
+-			_w1 = (uint64_t)req->cmd.cdw10 |
+-			      ((uint64_t)req->cmd.cdw11 << 32);  /* SLBA */
+-			_w2 = (((uint64_t)(uint32_t)req->cmd.dptr.prp.prp1) << 32) |
+-			      ((uint64_t)((req->cmd.cdw12 >> 16) & 0xFFFFu) <<  0) |
+-			      ((uint64_t)( req->cmd.cdw12        & 0xFFFFu) << 16);
+-			/* w2 layout: [63:32] prp1_lo32 | [31:16] nlb | [15:0] control
+-			 * NVMe cdw12 = [31:16] control | [15:0] nlb (0-based).  We
+-			 * pack them swapped so the controller-side decode matches the
+-			 * plan's wire format. */
+-			g_thread_mmio_ctrlr = pctrlr;
+-			spdk_mmio_write_8(&_slot[0], _w0);
+-			spdk_mmio_write_8(&_slot[1], _w1);
+-			spdk_mmio_write_8(&_slot[2], _w2);
+-			g_thread_mmio_ctrlr = NULL;
+-		}
+-#ifndef SPDK_NVME_IO_CYCLE_OFF
+-		req->t_cmd_end   = nvme_io_cycle_rdtsc();
+-		req->t_doorbell  = req->t_cmd_end;   /* no SQ doorbell */
+-		req->t_fence_end = req->t_cmd_end;   /* no fence (no doorbell) */
+-		req->t_db_end    = req->t_cmd_end;
+-		req->t_poll_start = pqpair->poll_cycle_accum;
+-#endif
+-		pqpair->stat->sq_mmio_doorbell_updates++;  /* keep counter for fairness */
+-
+-		/* Mailbox path bypasses host SQ memory entirely; the SQE never
+-		 * lands there.  Advancing sq_tail here would cause a later SQ
+-		 * tail doorbell write (driven by delay_cmd_submit batching, or
+-		 * by an interleaved standard-path command) to instruct the
+-		 * controller to fetch SQEs from the previous sq_tail to the
+-		 * current one — but those slots in host SQ memory are zero/
+-		 * stale, yielding phantom commands with cid=0 that come back
+-		 * as 'cpl does not map to outstanding cmd' and pollute the
+-		 * Mech #1 free-CID ring with bogus recycles.  Leave sq_tail
+-		 * untouched; the controller has the command via mailbox MMIO. */
+-		return;
+-	}
+-
+ 	if (req->cmd.fuse) {
+ 		/*
+ 		 * Keep track of the fuse operation sequence so that we ring the doorbell only
+@@ -1021,18 +913,8 @@
+ 		req->retries++;
+ 		nvme_pcie_qpair_submit_tracker(qpair, tr);
+ 	} else {
+-		/* Mechanism #1: when the hardware free-CID ring is mapped AND this
+-		 * is an I/O qpair, hardware auto-recycles the CID on CQE flush and
+-		 * tracks the in-flight count.  We skip the symmetric TAILQ ops and
+-		 * the software queue_depth decrement; pqpair->tr[cid] is already
+-		 * free for reuse from the controller's perspective. */
+-		struct nvme_pcie_ctrlr *_pctrlr = nvme_pcie_ctrlr(qpair->ctrlr);
+-		bool hw_managed = (_pctrlr->uncore_free_cid_base != NULL &&
+-				   qpair->id != 0);
+-		if (!hw_managed) {
+-			TAILQ_REMOVE(&pqpair->outstanding_tr, tr, tq_list);
+-			pqpair->qpair.queue_depth--;
+-		}
++		TAILQ_REMOVE(&pqpair->outstanding_tr, tr, tq_list);
++		pqpair->qpair.queue_depth--;
+ #ifndef SPDK_NVME_IO_CYCLE_OFF
+ 		req->t_dealloc_pre_end = nvme_io_cycle_rdtsc();
+ 
+@@ -1064,9 +946,7 @@
+ 
+ 		tr->req = NULL;
+ 
+-		if (!hw_managed) {
+-			TAILQ_INSERT_HEAD(&pqpair->free_tr, tr, tq_list);
+-		}
++		TAILQ_INSERT_HEAD(&pqpair->free_tr, tr, tq_list);
+ 	}
+ }
+ 
+@@ -1199,71 +1079,6 @@
+ 		return -ENXIO;
+ 	}
+ 
+-	/* IO-Uncore Mode 2B (poll-lite) early exit. When the on-die uncore
+-	 * publishes hint=0, no I/O CQEs are queued in the lCQFIFO, so the
+-	 * DRAM CQ phase-bit scan would only churn cachelines for nothing.
+-	 * Skip on I/O qpairs (qid != 0); admin queue always polls to avoid
+-	 * starving controller commands. Dormant when uncore_hint_reg is NULL.
+-	 *
+-	 * Must also be gated on NVME_QPAIR_CONNECTED: during the connect
+-	 * handshake the qpair is in NVME_QPAIR_CONNECTING and the connect
+-	 * completion arrives on the adminq, which is processed by the
+-	 * CONNECTING branch below (lines following).  Returning 0 here while
+-	 * still connecting causes spdk_nvme_poll_group_all_connected() to
+-	 * never observe the qpair as connected, and init_ns_worker_ctx()
+-	 * times out after 10 s with "ERROR: init_ns_worker_ctx() failed". */
+-	{
+-		struct nvme_pcie_ctrlr *pctrlr =
+-			nvme_pcie_ctrlr(qpair->ctrlr);
+-#ifdef SPDK_NVME_DBG_MECH4
+-		static uint64_t _dbg_proc_calls = 0;
+-		static uint64_t _dbg_hint_reg_null = 0;
+-		static uint64_t _dbg_hint_qid0 = 0;
+-		static uint64_t _dbg_hint_state = 0;
+-		static uint64_t _dbg_hint_entered = 0;
+-		_dbg_proc_calls++;
+-#endif
+-		enum nvme_qpair_state _st_now = nvme_qpair_get_state(qpair);
+-		bool _live = (_st_now == NVME_QPAIR_CONNECTED) ||
+-			      (_st_now == NVME_QPAIR_ENABLED);
+-#ifdef SPDK_NVME_DBG_MECH4
+-		if (pctrlr->uncore_hint_reg == NULL) {
+-			_dbg_hint_reg_null++;
+-		} else if (qpair->id == 0) {
+-			_dbg_hint_qid0++;
+-		} else if (!_live) {
+-			_dbg_hint_state++;
+-		} else {
+-			_dbg_hint_entered++;
+-		}
+-		if ((_dbg_proc_calls & 0xFFFFF) == 1) {
+-			fprintf(stderr,
+-				"[DBG_MECH4] calls=%lu reg_null=%lu qid0=%lu state=%lu entered=%lu "
+-				"qid=%u state_now=%d hint_reg=%p\n",
+-				_dbg_proc_calls, _dbg_hint_reg_null,
+-				_dbg_hint_qid0, _dbg_hint_state,
+-				_dbg_hint_entered, qpair->id,
+-				(int)_st_now,
+-				(void *)pctrlr->uncore_hint_reg);
+-		}
+-#endif
+-		if (spdk_likely(pctrlr->uncore_hint_reg != NULL) &&
+-		    spdk_likely(qpair->id != 0) &&
+-		    spdk_likely(_live)) {
+-			uint32_t hint = *pctrlr->uncore_hint_reg;
+-			uint16_t count = (uint16_t)(hint & 0xFFFFu);
+-			uint16_t age   = (uint16_t)(hint >> 16);
+-			/* Mechanism #4: skip the CQ scan only when BOTH there is no
+-			 * work AND the oldest pending CQE is fresh enough that we'd
+-			 * rather batch.  AGE_THRESHOLD = 4 (= 4 µs @ default 1 µs/
+-			 * unit granularity) keeps worst-case completion latency
+-			 * bounded.  When age >= threshold, fall through to scan. */
+-			if (count == 0 && age < 4) {
+-				return 0;
+-			}
+-		}
+-	}
+-
+ #ifndef SPDK_NVME_IO_CYCLE_OFF
+ 	poll_start = nvme_io_cycle_rdtsc();
+ #endif
+@@ -1307,119 +1122,11 @@
+ 	}
+ 
+ 	pqpair->stat->polls++;
+-	pqpair->stat->completion_calls++;
+ 
+-	/* IO-Uncore v3 (Mode C) completion path.  When the on-die uncore publishes
+-	 * 16-byte completion records into a host-DRAM ring (cq_rec_ring), the host
+-	 * polls that cacheable ring INSTEAD of scanning the NVMe CQ.  Each record
+-	 * carries the host tracker pointer (cookie, echoed from the SQ descriptor
+-	 * w2), so there is no cpl->cid -> pqpair->tr[cid] lookup, and the host never
+-	 * rings the CQ-head doorbell (the device owns CQ-head advancement).  CID is
+-	 * host-managed (Decision (a)): under Mode C uncore_free_cid_base is unmapped,
+-	 * so complete_tracker's hw_managed gate is false and it does the standard
+-	 * TAILQ free-list return + app callback.  Reads NO hint register (that reg
+-	 * is NULL under Mode C, so the early-exit above took the reg_null path).
+-	 * Gated per qpair on cq_rec_ring != NULL (I/O qpairs only; admin never has
+-	 * a record ring).  Modes 0/1/2 and Mode B/v2 fall through to the normal scan
+-	 * below unchanged. */
+ 	/* Mode D (v4.1) completion-callback ring: the device DMA-wrote a 32B record
+ 	 * carrying the pre-decoded cpl + the host callback, so the host loop does
+-	 * only cb_fn(cb_arg,&cpl) + a lean tracker/req recycle — no NVMe status
+-	 * decode, no complete_tracker body.  Mode D sets both env vars, so exclude it
+-	 * from mode_c below. */
+-	/* Mode E (v4.2) uses the same 32B completion record as Mode D but drops even
+-	 * the lean recycle (the device owns the tracker-slot lifecycle via the
+-	 * free-slot ring).  Mode E sets all three env vars, so test it FIRST and
+-	 * exclude it from mode_d / mode_c. */
+-	bool mode_e = (uncore_mode_e() && pqpair->cq_rec_ring != NULL && qpair->id != 0);
+-	bool mode_d = (!mode_e && uncore_mode_d() && pqpair->cq_rec_ring != NULL && qpair->id != 0);
+-	bool mode_c = (!mode_d && !mode_e && uncore_mode_c() && pqpair->cq_rec_ring != NULL && qpair->id != 0);
+-
+-	if (mode_e) {
+-		/* Mode E completion loop: read the 32B callback record, fire the ECHOED
+-		 * cb_fn(cb_arg,&cpl) directly, free the request — and do NOTHING to the
+-		 * tracker free list (the device recycles the slot into the free-slot ring
+-		 * that the submit path pops).  tr[cid] is recovered only to free its
+-		 * request; tr->req is NULLed BEFORE the callback so a callback that
+-		 * resubmits and re-pops this very slot cannot be clobbered afterwards. */
+-		volatile struct nvme_uncore_cq_cb_rec *ring_e =
+-			(volatile struct nvme_uncore_cq_cb_rec *)pqpair->cq_rec_ring;
+-		while (1) {
+-			volatile struct nvme_uncore_cq_cb_rec *rec = &ring_e[pqpair->cq_rec_head];
+-			uint64_t cpl_hi = rec->cpl_hi;
+-#ifndef SPDK_NVME_IO_CYCLE_OFF
+-			uint64_t cqe_seen = nvme_io_cycle_rdtsc();
+-#endif
+-
+-			if (((uint8_t)((cpl_hi >> 48) & 0x1u)) != pqpair->cq_rec_phase) {
+-				break;
+-			}
+-
+-			uint64_t rec_cb_fn  = rec->cb_fn;
+-			uint64_t rec_cb_arg = rec->cb_arg;
+-			uint64_t cpl_lo     = rec->cpl_lo;
+-			uint16_t cid        = (uint16_t)((cpl_hi >> 32) & 0xFFFFu);
+-
+-			if (spdk_unlikely(++pqpair->cq_rec_head == pqpair->num_entries)) {
+-				pqpair->cq_rec_head = 0;
+-				pqpair->cq_rec_phase = !pqpair->cq_rec_phase;
+-			}
+-
+-			/* Recover the request only to return it to the pool; the tracker slot
+-			 * itself is recycled by the device (free-slot ring), so there is NO
+-			 * TAILQ_REMOVE / TAILQ_INSERT / queue_depth here. */
+-			tr = &pqpair->tr[cid];
+-
+-			if (spdk_likely(tr->req != NULL)) {
+-				struct nvme_request *req = tr->req;
+-				struct spdk_nvme_cpl cpl_rec;
+-
+-				memcpy((uint8_t *)&cpl_rec + 0, &cpl_lo, 8);
+-				memcpy((uint8_t *)&cpl_rec + 8, &cpl_hi, 8);
+-
+-#ifndef SPDK_NVME_IO_CYCLE_OFF
+-				req->t_cqe_seen = cqe_seen;
+-				req->t_completion = cqe_seen;
+-				req->t_cqe_valid_end = nvme_io_cycle_rdtsc();
+-				req->t_tr_lookup_end = nvme_io_cycle_rdtsc();
+-				if (req->t_doorbell != 0) {
+-					uint64_t poll_elapsed = nvme_io_cycle_rdtsc() - poll_start;
+-					req->t_poll_cycles = pqpair->poll_cycle_accum +
+-						poll_elapsed - req->t_poll_start;
+-				}
+-#endif
+-
+-
+-				/* state_dealloc window: Mode E does NO tracker recycle (device
+-				 * owns it), so this is only the NULLing of tr->req.  Done BEFORE
+-				 * the callback so a re-pop of this slot inside cb_fn stands. */
+-				tr->req = NULL;
+-#ifndef SPDK_NVME_IO_CYCLE_OFF
+-				req->t_dealloc_pre_end = nvme_io_cycle_rdtsc();
+-				req->t_end = req->t_dealloc_pre_end;
+-#endif
+-				nvme_io_cycle_record(req);
+-
+-#ifndef SPDK_NVME_IO_CYCLE_OFF
+-				req->t_cb_start = nvme_io_cycle_rdtsc();
+-#endif
+-				((spdk_nvme_cmd_cb)(uintptr_t)rec_cb_fn)(
+-					(void *)(uintptr_t)rec_cb_arg, &cpl_rec);
+-				nvme_free_request(req);
+-#ifndef SPDK_NVME_IO_CYCLE_OFF
+-				req->t_cb_end = nvme_io_cycle_rdtsc();
+-#endif
+-			} else {
+-				NVME_QPAIR_ERRLOG(qpair,
+-					"mode-E cq record cid does not map to outstanding cmd\n");
+-				assert(0);
+-			}
+-
+-			if (++num_completions == max_completions) {
+-				break;
+-			}
+-		}
+-	}
++	 * only cb_fn(cb_arg,&cpl) + a lean tracker/req recycle. */
++	bool mode_d = (uncore_mode_d() && pqpair->cq_rec_ring != NULL && qpair->id != 0);
+ 
+ 	if (mode_d) {
+ 		volatile struct nvme_uncore_cq_cb_rec *ring_d =
+@@ -1523,84 +1230,7 @@
+ 		}
+ 	}
+ 
+-	if (mode_c) {
+-		while (1) {
+-			volatile struct nvme_uncore_cq_rec *rec =
+-				&pqpair->cq_rec_ring[pqpair->cq_rec_head];
+-			uint64_t w1 = rec->w1;
+-#ifndef SPDK_NVME_IO_CYCLE_OFF
+-			uint64_t cqe_seen = nvme_io_cycle_rdtsc();
+-#endif
+-
+-			/* Poll bit (locked record layout w1[48]) gates validity; it toggles
+-			 * on every ring wrap and matches pqpair->cq_rec_phase when ready.
+-			 * Cacheable read, NO MMIO. */
+-			if (((uint8_t)((w1 >> 48) & 0x1u)) != pqpair->cq_rec_phase) {
+-				break;
+-			}
+-
+-			/* Device publishes w0 (cookie) BEFORE w1 (phase-bit last), so once
+-			 * the poll bit matches, w0 is visible.  Decode the locked 16B record:
+-			 * w1[15:0]=status (native phase bit forced 0 by producer),
+-			 * w1[47:32]=cid, w0=cookie=host tracker pointer. */
+-			uint64_t cookie = rec->w0;
+-			uint16_t status = (uint16_t)(w1 & 0xFFFFu);
+-			uint16_t cid    = (uint16_t)((w1 >> 32) & 0xFFFFu);
+-
+-			/* Cookie IS the host tracker pointer — DIRECT cast, no tr[cid] map. */
+-			tr = (struct nvme_tracker *)(uintptr_t)cookie;
+-
+-			/* Advance the record-ring cursor and toggle the expected poll phase
+-			 * on wrap.  Never touch cq_head / flags.phase and never ring the
+-			 * CQ-head doorbell — the device owns CQ-head advancement. */
+-			if (spdk_unlikely(++pqpair->cq_rec_head == pqpair->num_entries)) {
+-				pqpair->cq_rec_head = 0;
+-				pqpair->cq_rec_phase = !pqpair->cq_rec_phase;
+-			}
+-
+-			if (spdk_likely(tr != NULL && tr->req != NULL)) {
+-				struct spdk_nvme_cpl cpl_rec;
+-
+-				/* Synthesize a local cpl from the record for complete_tracker. */
+-				memset(&cpl_rec, 0, sizeof(cpl_rec));
+-				cpl_rec.cid = cid;
+-				cpl_rec.sqid = qpair->id;
+-				cpl_rec.status_raw = status;
+-
+-				/* Completion instrumentation: cqe_detect ~ the cacheable poll-bit
+-				 * read; tracker_lookup = 0 (cookie is the tr, no lookup);
+-				 * state_dealloc is stamped inside complete_tracker (t_dealloc_pre_end,
+-				 * which also sets t_end so nvme_io_cycle_record's gate passes). */
+-#ifndef SPDK_NVME_IO_CYCLE_OFF
+-				tr->req->t_cqe_seen = cqe_seen;
+-				tr->req->t_completion = cqe_seen;
+-				tr->req->t_cqe_valid_end = nvme_io_cycle_rdtsc();
+-				tr->req->t_tr_lookup_end = tr->req->t_cqe_valid_end;
+-				if (tr->req->t_doorbell != 0) {
+-					uint64_t poll_elapsed = nvme_io_cycle_rdtsc() - poll_start;
+-					tr->req->t_poll_cycles = pqpair->poll_cycle_accum +
+-						poll_elapsed - tr->req->t_poll_start;
+-				}
+-#endif
+-
+-				__builtin_prefetch(&tr->req->stailq);
+-				/* Reuse complete_tracker unchanged: hw_managed==false gives the
+-				 * cheap TAILQ free-list return + app callback + t_end stamp, and
+-				 * it never touches cq_head/phase (that is scan-only). */
+-				nvme_pcie_qpair_complete_tracker(qpair, tr, &cpl_rec, true);
+-			} else {
+-				NVME_QPAIR_ERRLOG(qpair,
+-					"mode-C cq record cookie does not map to outstanding cmd\n");
+-				assert(0);
+-			}
+-
+-			if (++num_completions == max_completions) {
+-				break;
+-			}
+-		}
+-	}
+-
+-	while (!mode_c && !mode_d && !mode_e) {
++	while (!mode_d) {
+ 		cpl = &pqpair->cpl[pqpair->cq_head];
+ 
+ 		if (!next_is_valid && cpl->status.p != pqpair->flags.phase) {
+@@ -1673,27 +1303,18 @@
+ 
+ 	if (num_completions > 0) {
+ 		pqpair->stat->completions += num_completions;
+-		/* Mode C/D/E: the device owns CQ-head advancement (host consumed the
++		/* Mode D: the device owns CQ-head advancement (host consumed the
+ 		 * record ring, not the NVMe CQ), so do NOT ring the CQ-head doorbell. */
+-		if (!mode_c && !mode_d && !mode_e) {
++		if (!mode_d) {
+ 			nvme_pcie_qpair_ring_cq_doorbell(qpair);
+ 		}
+ 	} else {
+ 		pqpair->stat->idle_polls++;
+ 	}
+ 
+-	/* Track histogram of completions per call (last bucket is 32+) */
+-	{
+-		uint32_t hist_idx = num_completions;
+-		if (hist_idx >= 32) {
+-			hist_idx = 32;
+-		}
+-		pqpair->stat->completion_calls_hist[hist_idx]++;
+-	}
+-
+ 	if (pqpair->flags.delay_cmd_submit) {
+ 		if (pqpair->sq_desc_ring != NULL) {
+-			/* IO-Uncore v3 (Mode C): batch on the descriptor-ring cursor.
++			/* IO-Uncore v4.1 (Mode D): batch on the descriptor-ring cursor.
+ 			 * ring_sq_doorbell publishes sq_desc_tail (not sq_tail).  Per-IO
+ 			 * t_doorbell is already stamped at submit, so mark_doorbell_time
+ 			 * is a no-op here — the batched doorbell is not attributed per IO. */
+@@ -2409,108 +2030,33 @@
+ 		nvme_ctrlr_lock(ctrlr);
+ 	}
+ 
+-	{
+-		struct nvme_pcie_ctrlr *_pctrlr_alloc = nvme_pcie_ctrlr(ctrlr);
+-		if (_pctrlr_alloc->uncore_free_cid_base != NULL && qpair->id != 0) {
+-			/* Mechanism #1: hardware free-CID ring path.  One MMIO read
+-			 * replaces TAILQ_FIRST + TAILQ_REMOVE + TAILQ_INSERT_TAIL +
+-			 * the software queue_depth increment.  pqpair->tr[hw_cid] is
+-			 * the per-tracker slot the hardware reserves for this CID. */
+-			uint32_t hw_cid = _pctrlr_alloc->uncore_free_cid_base[qpair->id];
+-			if (hw_cid == 0xFFFFu) {
+-				pqpair->stat->queued_requests++;
+-				rc = -EAGAIN;
+-				goto exit;
+-			}
+-			tr = &pqpair->tr[hw_cid];
+-			tr->req = req;
+-			tr->cb_fn = req->cb_fn;
+-			tr->cb_arg = req->cb_arg;
+-			req->cmd.cid = (uint16_t)hw_cid;
+-			pqpair->stat->submitted_requests++;
+-			/* Skip TAILQ ops + queue_depth++; hw owns CID lifecycle.
+-			 * Mechanism #2: read the on-die hardware in-flight counter
+-			 * and refresh the software shadow. This is the structurally-
+-			 * required complement to Mechanism #1 (per RTL spec §13.3) —
+-			 * once HW owns CID allocation, pqpair->qpair.queue_depth would
+-			 * otherwise drift stale (the inc/dec was skipped above). One
+-			 * MMIO read replaces ~4 software ops on every submit. */
+-			if (_pctrlr_alloc->uncore_qdepth_base != NULL) {
+-				pqpair->qpair.queue_depth =
+-					_pctrlr_alloc->uncore_qdepth_base[qpair->id];
+-			}
+-		} else if (uncore_mode_e() && pqpair->free_slot_ring != NULL &&
+-			   qpair->id != 0) {
+-			/* IO-Uncore v4.2 (Mode E): POP a device-fed free tracker slot from
+-			 * the host-DRAM free-slot ring instead of walking the tracker free
+-			 * list.  One cacheable DRAM read (the slot line the device DMA-wrote)
+-			 * + a cursor advance replaces TAILQ_FIRST + TAILQ_REMOVE +
+-			 * TAILQ_INSERT_TAIL + queue_depth++.  No outstanding_tr list and no
+-			 * queue_depth are maintained (Mode E does not support abort/reset —
+-			 * it is a steady-state perf mode); the free-slot ring itself provides
+-			 * backpressure (phase mismatch => -EAGAIN, requeued like a full
+-			 * free-list). */
+-			uint64_t slot_e = pqpair->free_slot_ring[pqpair->free_slot_head];
+-			if (((slot_e >> FREE_SLOT_PHASE_BIT) & 0x1u) != pqpair->free_slot_phase) {
+-				/* Device has not published the next free slot yet. */
+-				pqpair->stat->queued_requests++;
+-				rc = -EAGAIN;
+-				goto exit;
+-			}
+-			uint16_t slot_idx = (uint16_t)(slot_e & 0xFFFFu);
+-			if (spdk_unlikely(++pqpair->free_slot_head == pqpair->num_entries)) {
+-				pqpair->free_slot_head = 0;
+-				pqpair->free_slot_phase ^= 1;
+-			}
+-			pqpair->stat->submitted_requests++;
+-			tr = &pqpair->tr[slot_idx];
+-			tr->req = req;
+-			tr->cb_fn = req->cb_fn;
+-			tr->cb_arg = req->cb_arg;
+-			req->cmd.cid = slot_idx;
+-		} else {
+-			/* Standard path (Mode 0/1 or Mech #1 not mapped). */
+-			tr = TAILQ_FIRST(&pqpair->free_tr);
+-			if (tr == NULL) {
+-				pqpair->stat->queued_requests++;
+-				rc = -EAGAIN;
+-				goto exit;
+-			}
+-			pqpair->stat->submitted_requests++;
+-			TAILQ_REMOVE(&pqpair->free_tr, tr, tq_list);
+-			TAILQ_INSERT_TAIL(&pqpair->outstanding_tr, tr, tq_list);
+-			pqpair->qpair.queue_depth++;
+-			tr->req = req;
+-			tr->cb_fn = req->cb_fn;
+-			tr->cb_arg = req->cb_arg;
+-			req->cmd.cid = tr->cid;
+-		}
++	tr = TAILQ_FIRST(&pqpair->free_tr);
++
++	if (tr == NULL) {
++		pqpair->stat->queued_requests++;
++		/* Inform the upper layer to try again later. */
++		rc = -EAGAIN;
++		goto exit;
+ 	}
++
++	pqpair->stat->submitted_requests++;
++	TAILQ_REMOVE(&pqpair->free_tr, tr, tq_list); /* remove tr from free_tr */
++	TAILQ_INSERT_TAIL(&pqpair->outstanding_tr, tr, tq_list);
++	pqpair->qpair.queue_depth++;
++	tr->req = req;
++	tr->cb_fn = req->cb_fn;
++	tr->cb_arg = req->cb_arg;
++	req->cmd.cid = tr->cid;
+ #ifndef SPDK_NVME_IO_CYCLE_OFF
+ 	req->t_tr_alloc_end = nvme_io_cycle_rdtsc();
+ #endif
+ 	/* Use PRP by default. This bit will be overridden below if needed. */
+ 	req->cmd.psdt = SPDK_NVME_PSDT_PRP;
+ 
+-	/* IO-Uncore v3 (Mode C) host-DRAM descriptor-ring submit path.  Like the
+-	 * Mode-B mailbox path it bypasses PRP-list construction, the 64-byte SQE
+-	 * copy and the per-IO doorbell — but instead of MMIO-writing the compact
+-	 * descriptor it does a PLAIN CACHEABLE STORE into a host-DRAM ring slot and
+-	 * rings only a batched SQ doorbell (via the delay_cmd_submit deferral, or
+-	 * immediately when batching is disabled).  CID is host-managed: this branch
+-	 * runs only when uncore_free_cid_base is unmapped, so the CID-alloc gate
+-	 * above took the standard TAILQ path and tr / req->cmd.cid are already set.
+-	 * Phase 1 leaves the completion path completely unchanged (normal CQ scan).
+-	 *
+-	 * Timestamps: t_xlate_end := t_tr_alloc_end (addr_xlate elided);
+-	 * t_sqe_copy just before the ring store; t_cmd_end just after it;
+-	 * t_doorbell/t_fence_end/t_db_end := t_cmd_end (the doorbell is batched and
+-	 * not attributed per IO). */
+ 	/* IO-Uncore v4.1 (Mode D) submit: write a LOCKED 40B descriptor — the Mode-C
+ 	 * 24B layout (w0/w1/w2) plus w3=cb_arg, w4=cb_fn — so the device can echo the
+-	 * host completion callback into the 32B completion-callback record.  Checked
+-	 * BEFORE the Mode-C branch because Mode D sets both env vars (uncore_mode_c()
+-	 * is also true).  Plain cacheable ring stores, NO MMIO. */
++	 * host completion callback into the 32B completion-callback record.  Mode D reuses the
++	 * Mode C ring allocation (both env vars set at setup).  Plain cacheable ring stores, NO MMIO. */
+ 	if (uncore_mode_d() &&
+ 	    pqpair->sq_desc_ring != NULL &&
+ 	    qpair->id != 0 &&
+@@ -2558,154 +2104,6 @@
+ 		goto exit;
+ 	}
+ 
+-	if (uncore_mode_c() &&
+-	    pqpair->sq_desc_ring != NULL &&
+-	    qpair->id != 0 &&
+-	    req->payload_size <= 131072u &&
+-	    (req->cmd.opc == SPDK_NVME_OPC_READ ||
+-	     req->cmd.opc == SPDK_NVME_OPC_WRITE)) {
+-		uint64_t _w0, _w1, _w2;
+-		uint32_t _idx = pqpair->sq_desc_tail;
+-
+-		/* Path-E fast path never dereferences PRP1/PRP2 (no data DMA); the
+-		 * on-die SQ Engine would resolve VA -> IOVA in real HW. */
+-		req->cmd.dptr.prp.prp1 = 0;
+-		req->cmd.dptr.prp.prp2 = 0;
+-#ifndef SPDK_NVME_IO_CYCLE_OFF
+-		req->t_xlate_end = req->t_tr_alloc_end;  /* addr_xlate elided */
+-#endif
+-
+-		/* w0/w1 packing byte-identical to the v2 16B compact SQE; w2 carries
+-		 * the opaque host tracker pointer (device stores it keyed by
+-		 * {qid,cid}; dormant in Phase 1). */
+-		_w0 = ((uint64_t)(req->cmd.opc  & 0xFFu) << 56) |
+-		      ((uint64_t)(req->cmd.fuse & 0xFFu) << 48) |
+-		      ((uint64_t) req->cmd.cid           << 32) |
+-		      ((uint64_t)(req->cmd.cdw12 & 0xFFFFu) << 16) |
+-		      ((uint64_t)((req->cmd.cdw12 >> 16) & 0xFFFFu));
+-		_w1 = (uint64_t)req->cmd.cdw10 |
+-		      ((uint64_t)req->cmd.cdw11 << 32);
+-		_w2 = (uint64_t)(uintptr_t)tr;
+-
+-#ifndef SPDK_NVME_IO_CYCLE_OFF
+-		req->t_sqe_copy = nvme_io_cycle_rdtsc();
+-#endif
+-		/* PLAIN CACHEABLE STORES into the host-DRAM ring — NOT MMIO. */
+-		pqpair->sq_desc_ring[_idx].w0 = _w0;
+-		pqpair->sq_desc_ring[_idx].w1 = _w1;
+-		pqpair->sq_desc_ring[_idx].w2 = _w2;
+-#ifndef SPDK_NVME_IO_CYCLE_OFF
+-		req->t_cmd_end   = nvme_io_cycle_rdtsc();
+-		req->t_doorbell  = req->t_cmd_end;   /* doorbell batched, not per IO */
+-		req->t_fence_end = req->t_cmd_end;
+-		req->t_db_end    = req->t_cmd_end;
+-		req->t_poll_start = pqpair->poll_cycle_accum;
+-#endif
+-
+-		/* Advance the descriptor-ring producer index (NOT the NVMe sq_tail).
+-		 * Ring the SQ doorbell through the BATCHED delay_cmd_submit path: when
+-		 * batching is on, the deferred flush in process_completions coalesces
+-		 * one doorbell per poll (~0.13 doorbells/IO); when off, ring now. */
+-		pqpair->sq_desc_tail = (uint32_t)((_idx + 1) % pqpair->num_entries);
+-		if (!pqpair->flags.delay_cmd_submit) {
+-			nvme_pcie_qpair_ring_sq_doorbell(qpair);
+-			pqpair->last_sq_desc_tail = pqpair->sq_desc_tail;
+-		}
+-		rc = 0;
+-		goto exit;
+-	}
+-
+-	/* IO-Uncore Mode 2B deep-offload entry point.  This is the EARLY branch
+-	 * that bypasses the per-IO PRP-list construction (~337 ns/IO at QD=128)
+-	 * AND the 64-byte SQE copy (~51 ns/IO) AND the doorbell ring (~3 ns/IO).
+-	 * The compact 24-byte descriptor is emitted as 3 sequential 8-byte MMIO
+-	 * writes to the per-qid mailbox slot; the controller's SQ Engine
+-	 * synthesizes the full SQE on-die (modeled in SimpleSSD with a fixed
+-	 * cycle budget; see MailboxLatch/MailboxDecode/MailboxInject cfg).
+-	 *
+-	 * Falls back to the standard path for:
+-	 *   - admin qpair (qid == 0): admin commands always use full path
+-	 *   - multi-page transfers: needs PRP list (v1 limitation)
+-	 *   - non-read/write opcodes: needs full command construction
+-	 *   - mailbox not mapped (SPDK_UNCORE_MODE_B != 1)
+-	 *
+-	 * Timestamps are collapsed so the cycle_breakdown CSV reflects which
+-	 * stages the hardware absorbed:
+-	 *   t_xlate_end := t_tr_alloc_end   (addr_xlate_ns == 0)
+-	 *   t_sqe_copy/t_cmd_end := after the 3 MMIO writes
+-	 *   t_fence_end/t_db_end/t_doorbell := t_cmd_end (fence_ns, doorbell_ns == 0)
+-	 */
+-	{
+-		struct nvme_pcie_ctrlr *_pctrlr = nvme_pcie_ctrlr(ctrlr);
+-		if (_pctrlr->uncore_mailbox_base != NULL &&
+-		    qpair->id != 0 &&
+-		    req->payload_size <= (uncore_multipage() ? 131072u : ctrlr->page_size) &&
+-		    (req->cmd.opc == SPDK_NVME_OPC_READ ||
+-		     req->cmd.opc == SPDK_NVME_OPC_WRITE)) {
+-			uint64_t _w0, _w1, _w2;
+-			volatile uint64_t *_slot;
+-			/* PRP1 is conventionally the IOVA of the host payload buffer.
+-			 * In the simulator's Path-E fast path the controller never
+-			 * dereferences it (no actual data DMA), so we can pass 0 here
+-			 * — real hardware would have the on-die SQ Engine resolve
+-			 * VA -> IOVA via the IOMMU page-table cache. */
+-			req->cmd.dptr.prp.prp1 = 0;
+-			req->cmd.dptr.prp.prp2 = 0;
+-#ifndef SPDK_NVME_IO_CYCLE_OFF
+-			req->t_xlate_end = req->t_tr_alloc_end;  /* addr_xlate elided */
+-#endif
+-			_slot = _pctrlr->uncore_mailbox_base +
+-			        (qpair->id * (MAILBOX_STRIDE_BYTES / sizeof(uint64_t)));
+-#ifndef SPDK_NVME_IO_CYCLE_OFF
+-			req->t_sqe_copy = nvme_io_cycle_rdtsc();
+-#endif
+-			if (uncore_sqe16()) {
+-				/* v2 16-byte compact SQE: 2 MMIO writes.  gem5 expects
+-				 * nlb at w0[31:16] and control at w0[15:0]; cdw12 packs
+-				 * control<<16 | nlb, hence the swap below.  nsid is fixed
+-				 * to 1 and prp1_lo is dropped. */
+-				_w0 = ((uint64_t)(req->cmd.opc  & 0xFFu) << 56) |
+-				      ((uint64_t)(req->cmd.fuse & 0xFFu) << 48) |
+-				      ((uint64_t) req->cmd.cid           << 32) |
+-				      ((uint64_t)(req->cmd.cdw12 & 0xFFFFu) << 16) |
+-				      ((uint64_t)((req->cmd.cdw12 >> 16) & 0xFFFFu));
+-				_w1 = (uint64_t)req->cmd.cdw10 |
+-				      ((uint64_t)req->cmd.cdw11 << 32);
+-				g_thread_mmio_ctrlr = _pctrlr;
+-				spdk_mmio_write_8(&_slot[0], _w0);
+-				spdk_mmio_write_8(&_slot[1], _w1);
+-				g_thread_mmio_ctrlr = NULL;
+-			} else {
+-				_w0 = ((uint64_t)(req->cmd.opc  & 0xFFu) << 56) |
+-				      ((uint64_t)(req->cmd.fuse & 0xFFu) << 48) |
+-				      ((uint64_t) req->cmd.cid           << 32) |
+-				      ((uint64_t) req->cmd.nsid                );
+-				_w1 = (uint64_t)req->cmd.cdw10 |
+-				      ((uint64_t)req->cmd.cdw11 << 32);  /* SLBA */
+-				_w2 = ((uint64_t)((req->cmd.cdw12 >> 16) & 0xFFFFu) <<  0) |
+-				      ((uint64_t)( req->cmd.cdw12        & 0xFFFFu) << 16);
+-				g_thread_mmio_ctrlr = _pctrlr;
+-				spdk_mmio_write_8(&_slot[0], _w0);
+-				spdk_mmio_write_8(&_slot[1], _w1);
+-				spdk_mmio_write_8(&_slot[2], _w2);
+-				g_thread_mmio_ctrlr = NULL;
+-			}
+-#ifndef SPDK_NVME_IO_CYCLE_OFF
+-			req->t_cmd_end   = nvme_io_cycle_rdtsc();
+-			req->t_doorbell  = req->t_cmd_end;
+-			req->t_fence_end = req->t_cmd_end;
+-			req->t_db_end    = req->t_cmd_end;
+-#endif
+-			pqpair->stat->sq_mmio_doorbell_updates++;
+-			/* Do NOT advance sq_tail — mailbox writes do not touch
+-			 * host SQ memory.  See the longer rationale in the
+-			 * sibling mailbox path inside nvme_pcie_qpair_submit_tracker
+-			 * (search for "phantom commands with cid=0"). */
+-			rc = 0;
+-			goto exit;
+-		}
+-	}
+-
+ 	if (req->payload_size != 0) {
+ 		payload_type = nvme_payload_type(&req->payload);
+ 		/* According to the specification, PRPs shall be used for all

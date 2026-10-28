@@ -1,0 +1,6 @@
+# inv-patch: 01-floor
+# purpose: app-only floor of spec §5.2 (loopback I/O table; an upper bound on app-only IOPS)
+# safety: SAFE
+# breaks: no device I/O while SPDK_INV_FLOOR=1 (by design); probe/attach and qpair allocation still need a live target
+# env: SPDK_INV_FLOOR=1 (default off)
+# base: 00-spin.diff

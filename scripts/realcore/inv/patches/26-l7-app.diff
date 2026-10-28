@@ -1,0 +1,104 @@
+# inv-patch: 26-l7-app
+# purpose: L7 harness overhead (spec C8, J, H10): with SPDK_INV_TRACE_FAST=1 the trace replay in perf.c reads a per-ns_ctx table of exactly g_trace_count precomputed (offset_in_ios << 1 | is_read) values and wraps the cursor with a compare-and-reset, instead of a 64-bit modulo by g_trace_count, a 64-bit division by g_io_size_bytes and a conditional modulo by size_in_ios on every IO (no 64-bit division per IO); the flag is parsed once in main(), the table is built on the first IO of each ns_ctx inside the fast branch only (one stderr line "INV_TRACE_FAST entries=N" per ns_ctx), and with the env unset the stock per-IO path gains one load and one not-taken branch in front of the unchanged trace-replay lines
+# safety: SAFE
+# breaks: none for the replayed sequence (identical to stock); the table build (~tens of ms) runs on each worker's first IO, so runs must use --warmup-time
+# env: SPDK_INV_TRACE_FAST=1 (default off)
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff,12-residue.diff,13-iport.diff,20-l1-trfree.diff,22-l2-thin.diff
+diff -ruN a/app/spdk_nvme_perf/perf.c b/app/spdk_nvme_perf/perf.c
+--- a/app/spdk_nvme_perf/perf.c	2026-10-14 01:23:43.320289973 +0000
++++ b/app/spdk_nvme_perf/perf.c	2026-10-14 01:28:35.397292580 +0000
+@@ -43,6 +43,7 @@
+ int spdk_nvme_inv_thin_read(struct spdk_nvme_qpair *qpair, uint32_t nsid, uint64_t lba,
+ 			    uint32_t nlb, uint64_t buf_iova, spdk_nvme_cmd_cb cb_fn, void *cb_arg);
+ static bool g_inv_thin;	/* SPDK_INV_THIN=1, parsed once in main() */
++static bool g_inv_trace_fast;	/* inv 26-l7: SPDK_INV_TRACE_FAST=1, parsed once in main() */
+ 
+ #define HELP_RETURN_CODE UINT16_MAX
+ 
+@@ -176,6 +177,7 @@
+ 	int				status;
+ 	void			*inv_floor;	/* inv 01-floor loopback queue */
+ 	uint32_t		inv_nsid;	/* inv 22-l2-thin: nsid, read once at init */
++	uint64_t		*inv_lba;	/* inv 26-l7: (offset_in_ios << 1 | is_read) table, g_trace_count entries */
+ };
+ 
+ struct perf_task {
+@@ -1774,6 +1776,32 @@
+ 
+ static __thread uint64_t seed = 0;
+ 
++/* inv 26-l7: precompute (offset_in_ios << 1 | is_read) for exactly g_trace_count trace entries,
++ * so the per-IO path does no 64-bit division; the cursor wraps at g_trace_count like stock.
++ * Cold path, built on the first IO of each ns_ctx. */
++static __attribute__((noinline)) void
++inv_trace_fast_init(struct ns_worker_ctx *ns_ctx, struct ns_entry *entry)
++{
++	uint64_t j;
++
++	ns_ctx->inv_lba = malloc(g_trace_count * sizeof(uint64_t));
++	if (ns_ctx->inv_lba == NULL) {
++		fprintf(stderr, "inv 26: trace table allocation failed\n");
++		exit(1);
++	}
++	for (j = 0; j < g_trace_count; j++) {
++		const struct perf_trace_entry *e = &g_trace_entries[j];
++		uint64_t off = e->offset / g_io_size_bytes;
++
++		if (off >= entry->size_in_ios) {
++			off = off % entry->size_in_ios;
++		}
++		ns_ctx->inv_lba[j] = (off << 1) | (uint64_t)(e->op == 'R' || e->op == 'r');
++	}
++	ns_ctx->trace_cursor %= g_trace_count;
++	fprintf(stderr, "INV_TRACE_FAST entries=%" PRIu64 "\n", g_trace_count);
++}
++
+ static inline void
+ submit_single_io(struct perf_task *task)
+ {
+@@ -1791,12 +1819,25 @@
+ 		 * dividing by g_io_size_bytes is exact when -o 4096. */
+ 		/* Per-worker cursor: no cross-core atomic on the submit path (realcore T1.3).
+ 		 * Workers start at evenly spaced offsets and wrap independently. */
+-		uint64_t i = ns_ctx->trace_cursor++ % g_trace_count;
+-		offset_in_ios = g_trace_entries[i].offset / g_io_size_bytes;
+-		if (spdk_unlikely(offset_in_ios >= entry->size_in_ios)) {
+-			offset_in_ios = offset_in_ios % entry->size_in_ios;
++		if (spdk_unlikely(g_inv_trace_fast)) {
++			uint64_t v, c;
++
++			if (spdk_unlikely(ns_ctx->inv_lba == NULL)) {
++				inv_trace_fast_init(ns_ctx, entry);
++			}
++			c = ns_ctx->trace_cursor;
++			v = ns_ctx->inv_lba[c];
++			ns_ctx->trace_cursor = (c + 1 == g_trace_count) ? 0 : c + 1;
++			offset_in_ios = v >> 1;
++			task->is_read = (v & 1) != 0;
++		} else {
++			uint64_t i = ns_ctx->trace_cursor++ % g_trace_count;
++			offset_in_ios = g_trace_entries[i].offset / g_io_size_bytes;
++			if (spdk_unlikely(offset_in_ios >= entry->size_in_ios)) {
++				offset_in_ios = offset_in_ios % entry->size_in_ios;
++			}
++			task->is_read = (g_trace_entries[i].op == 'R' || g_trace_entries[i].op == 'r');
+ 		}
+-		task->is_read = (g_trace_entries[i].op == 'R' || g_trace_entries[i].op == 'r');
+ 	} else if (entry->zipf) {
+ 		offset_in_ios = spdk_zipf_generate(entry->zipf);
+ 	} else if (g_is_random) {
+@@ -3813,6 +3854,14 @@
+ 		}
+ 	}
+ 
++	/* inv 26-l7: parse once, here (strtoll == 1), so the per-IO path only tests a bool. */
++	{
++		const char *inv_tf_env = getenv("SPDK_INV_TRACE_FAST");
++
++		g_inv_trace_fast = inv_tf_env != NULL && inv_tf_env[0] != '\0' &&
++				   strtoll(inv_tf_env, NULL, 10) == 1;
++	}
++
+ 	/* Transport statistics are printed from each thread.
+ 	 * To avoid mess in terminal, init and use mutex */
+ 	rc = pthread_mutex_init(&g_stats_mutex, NULL);

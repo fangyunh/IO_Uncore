@@ -1,0 +1,3 @@
+arm_id,variant,tgt_variant,mode,env,trace
+post-m4,lean,,4,,
+post-m4-t2,lean,,4,IAU_DEV_TMAX=500000,

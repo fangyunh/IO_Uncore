@@ -1,0 +1,8 @@
+class,cap_iops,lmin_ns,insts,status,source
+SW-G5,2470000,50000,8,validated,"SwarmIO arXiv:2604.06668 calibration of the Solidigm D7-PS1010 (50 us, 2.47 MIOPS), measured against the drive; insts from configs/swarmio.conf at 25594a1a"
+SW-G5-N1,2470000,50000,1,sensitivity,"SW-G5 with num_sched_insts 1 (SwarmIO scripts/load.sh default)"
+SW-G5-N64,2470000,50000,64,sensitivity,"SW-G5 with 64 instances (the testbed's former channel count)"
+SW-G5-L10,2470000,10000,8,sensitivity,"SW-G5 at 10 us"
+SW-G5-L155,2470000,155000,8,sensitivity,"SW-G5 at 155 us (loaded NAND latency at QD512, sources.md 1.3)"
+SW-T10,10000000,50000,8,target,"SwarmIO scaled target (KIOXIA GP1 announces 10M at 512 B); at 4 KiB about 41 GB/s, beyond Gen6 x4, within Gen7 x4; Lmin kept from SW-G5"
+SW-T40,40000000,50000,8,projection,"SwarmIO configs/swarmio.conf target; not emulated (one SSD thread carries about 9-10M IOPS at busy 0.70, est.)"

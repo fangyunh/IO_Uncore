@@ -1,0 +1,340 @@
+# inv-patch: 20-l1-trfree
+# purpose: L1 oracle, tracker-free Mode D completion: with SPDK_INV_TRFREE=1 Mode-D IO qpairs allocate cids from a compact LIFO stack and carry the nvme_request pointer in descriptor w4 (echoed by the device in record w0), so submit and completion skip the tracker, the free_tr and outstanding_tr lists and the tr[cid] lookup. It also introduces the inv lever architecture every later lever follows: one hot byte inv_flags in the existing 2-byte hole after nvme_pcie_qpair.flags (INV_F_* bits set once at IO qpair construct, 0 = every lever off; a static assert locks offsetof(qpair) = 112 in the lean layout), all other lever state at the struct tail, env caches primed by a load-time constructor, and the stock hot paths diverting on inv_flags (one load + branch per poll and per submit) to noinline lever functions (inv_process_completions, marked hot and reached through a cold one-jmp trampoline so GCC keeps the stock block layout of the poll function; inv_trfree_submit, a tail call) while the stock completion loops and the shared poll tail stay unchanged
+# safety: UNSAFE
+# breaks: abort, timeout and teardown of in-flight Mode-D IO; iterate_requests, the timeout check and the abort walk do not see trfree IO; nvme_pcie_qpair_reset does not re-seed the stack (in-flight IO across a reset is lost); one cb_fn per req (no split IO); an IO qpair with the env set fails ineligible requests with -ENOTSUP (over 128 KiB or non-RW; logged once per process) instead of using a tracker, whose cid would collide with the stack; incompatible with Mode E (not enabled there); per-IO cycle records are not taken on this path. §4 L evidence: one stderr line per Mode-D IO qpair at construct, "INV_TRFREE qid=N cids=K", and at destroy "INV_TRFREE qid=N all K cids returned at destroy", or an ERROR line counting lost and extra cids (a push onto a full stack is counted, never written)
+# env: SPDK_INV_TRFREE=1 (default off)
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff,12-residue.diff,13-iport.diff
+diff -ruN a/lib/nvme/nvme_pcie_common.c b/lib/nvme/nvme_pcie_common.c
+--- a/lib/nvme/nvme_pcie_common.c	2026-10-14 00:51:48.105224347 +0000
++++ b/lib/nvme/nvme_pcie_common.c	2026-10-14 00:52:10.133100175 +0000
+@@ -21,6 +21,28 @@
+ 
+ static struct spdk_nvme_pcie_stat g_dummy_stat = {};
+ 
++/* inv: cached integer env knob; *cache < 0 = unread. */
++static inline int64_t
++inv_env_i64(const char *name, int64_t *cache, int64_t dflt)
++{
++	if (spdk_unlikely(*cache < 0)) {
++		const char *e = getenv(name);
++
++		*cache = (e != NULL && e[0] != '\0') ? (int64_t)strtoll(e, NULL, 10) : dflt;
++	}
++	return *cache;
++}
++
++static int64_t g_inv_trfree = -1;
++
++/* inv: read every lever env once at load time, on the main thread, so no worker thread
++ * fills a cache lazily; qpair construct then turns the values into inv_flags bits. */
++static void __attribute__((constructor))
++inv_env_prime(void)
++{
++	inv_env_i64("SPDK_INV_TRFREE", &g_inv_trfree, 0);
++}
++
+ static void nvme_pcie_fail_request_bad_vtophys(struct spdk_nvme_qpair *qpair,
+ 		struct nvme_tracker *tr);
+ 
+@@ -418,6 +440,26 @@
+ 		TAILQ_INSERT_HEAD(&pqpair->free_tr, tr, tq_list);
+ 	}
+ 
++	/* inv levers: bits are set here only (IO qpairs); 0 keeps every stock path. */
++	pqpair->inv_flags = 0;
++	if (qpair->id != 0 && inv_env_i64("SPDK_INV_TRFREE", &g_inv_trfree, 0) == 1 &&
++	    uncore_mode_d() && !uncore_mode_e() && pqpair->sq_desc_ring != NULL) {
++		pqpair->inv_cid_stack = calloc(num_trackers, sizeof(uint16_t));
++		if (pqpair->inv_cid_stack == NULL) {
++			return -ENOMEM;
++		}
++		/* LIFO like free_tr: the most recently freed cid is reused first
++		 * (gem5 §13 Mode-E lesson). */
++		for (i = 0; i < num_trackers; i++) {
++			pqpair->inv_cid_stack[i] = (uint16_t)(num_trackers - 1 - i);
++		}
++		pqpair->inv_cid_top = num_trackers;
++		pqpair->inv_cid_cap = num_trackers;
++		pqpair->inv_cid_extra = 0;
++		fprintf(stderr, "INV_TRFREE qid=%u cids=%u\n", qpair->id, (unsigned)num_trackers);
++		pqpair->inv_flags |= INV_F_TRFREE;
++	}
++
+ 	nvme_pcie_qpair_reset(qpair);
+ 
+ 	return 0;
+@@ -1059,6 +1101,100 @@
+ 	}
+ }
+ 
++/* inv: consume one Mode D record exactly like the stock loop (phase bit, the four words in the
++ * stock order, cursor advance with phase toggle). Returns false when no new record is visible. */
++static inline bool
++inv_rec_pop(struct nvme_pcie_qpair *pqpair, uint64_t *cb_fn, uint64_t *cb_arg, uint64_t *cpl_lo,
++	    uint64_t *cpl_hi)
++{
++	volatile struct nvme_uncore_cq_cb_rec *ring =
++		(volatile struct nvme_uncore_cq_cb_rec *)pqpair->cq_rec_ring;
++	volatile struct nvme_uncore_cq_cb_rec *rec = &ring[pqpair->cq_rec_head];
++	uint64_t hi = rec->cpl_hi;
++
++	if (((uint8_t)((hi >> 48) & 0x1u)) != pqpair->cq_rec_phase) {
++		return false;
++	}
++	*cb_fn = rec->cb_fn;
++	*cb_arg = rec->cb_arg;
++	*cpl_lo = rec->cpl_lo;
++	*cpl_hi = hi;
++	if (spdk_unlikely(++pqpair->cq_rec_head == pqpair->num_entries)) {
++		pqpair->cq_rec_head = 0;
++		pqpair->cq_rec_phase = !pqpair->cq_rec_phase;
++	}
++	return true;
++}
++
++/* inv 20-l1-trfree: record w0 echoes the nvme_request (descriptor w4); no tracker is touched. */
++static uint32_t
++inv_records_trfree(struct nvme_pcie_qpair *pqpair, uint32_t max_completions)
++{
++	uint64_t rec_cb_fn, rec_cb_arg, cpl_lo, cpl_hi;
++	uint32_t num_completions = 0;
++
++	while (inv_rec_pop(pqpair, &rec_cb_fn, &rec_cb_arg, &cpl_lo, &cpl_hi)) {
++		struct nvme_request *req = (struct nvme_request *)(uintptr_t)rec_cb_fn;
++		uint16_t cid = (uint16_t)((cpl_hi >> 32) & 0xFFFFu);
++		struct spdk_nvme_cpl cpl_rec;
++
++		memcpy((uint8_t *)&cpl_rec + 0, &cpl_lo, 8);
++		memcpy((uint8_t *)&cpl_rec + 8, &cpl_hi, 8);
++		assert(cid < pqpair->inv_cid_cap);
++		if (spdk_likely(pqpair->inv_cid_top < pqpair->inv_cid_cap)) {
++			pqpair->inv_cid_stack[pqpair->inv_cid_top++] = cid;
++		} else {
++			/* duplicate or bogus record: counted, reported at destroy */
++			pqpair->inv_cid_extra++;
++		}
++		pqpair->qpair.queue_depth--;
++		req->cb_fn((void *)(uintptr_t)rec_cb_arg, &cpl_rec);
++		nvme_free_request(req);
++		if (++num_completions == max_completions) {
++			break;
++		}
++	}
++	return num_completions;
++}
++
++static void __attribute__((noinline, cold))
++inv_no_completion_path(struct nvme_pcie_qpair *pqpair, uint8_t inv, bool mode_d)
++{
++	static bool inv_warned;
++
++	if (!inv_warned) {
++		inv_warned = true;
++		NVME_QPAIR_ERRLOG(&pqpair->qpair,
++				  "inv: no completion path for inv_flags 0x%x mode_d %d\n",
++				  inv, (int)mode_d);
++	}
++}
++
++/* inv: the lever completion loops, entered only when inv_flags != 0. Each returns the
++ * number of completions; the caller's shared poll tail (stats, CQ doorbell, SQ doorbell
++ * batching, timeouts) runs unchanged afterwards. */
++static uint32_t __attribute__((noinline, hot))
++inv_process_completions(struct nvme_pcie_qpair *pqpair, uint32_t max_completions, bool mode_d,
++			uint8_t inv)
++{
++	if (mode_d && (inv & INV_F_TRFREE)) {
++		return inv_records_trfree(pqpair, max_completions);
++	}
++	inv_no_completion_path(pqpair, inv, mode_d);
++	return 0;
++}
++
++/* inv: cold, noinline trampoline (a single jmp). Calling the lever loops through it puts the
++ * call in .text.unlikely, so GCC keeps the stock block layout of the poll function. The lever
++ * loops are marked hot so GCC does not infer them cold (and size-optimize them) from their
++ * only caller. */
++static uint32_t __attribute__((noinline, cold))
++inv_completions_trampoline(struct nvme_pcie_qpair *pqpair, uint32_t max_completions, bool mode_d,
++			   uint8_t inv)
++{
++	return inv_process_completions(pqpair, max_completions, mode_d, inv);
++}
++
+ int32_t
+ nvme_pcie_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_completions)
+ {
+@@ -1127,6 +1263,13 @@
+ 	 * carrying the pre-decoded cpl + the host callback, so the host loop does
+ 	 * only cb_fn(cb_arg,&cpl) + a lean tracker/req recycle. */
+ 	bool mode_d = (uncore_mode_d() && pqpair->cq_rec_ring != NULL && qpair->id != 0);
++	const uint8_t inv = pqpair->inv_flags;
++
++	if (spdk_unlikely(inv != 0)) {
++		/* inv levers: lever loops, then the shared tail below. */
++		num_completions = inv_completions_trampoline(pqpair, max_completions, mode_d, inv);
++		goto inv_poll_tail;
++	}
+ 
+ 	if (mode_d) {
+ 		volatile struct nvme_uncore_cq_cb_rec *ring_d =
+@@ -1301,6 +1444,7 @@
+ 		}
+ 	}
+ 
++inv_poll_tail:
+ 	if (num_completions > 0) {
+ 		pqpair->stat->completions += num_completions;
+ 		/* Mode D: the device owns CQ-head advancement (host consumed the
+@@ -1380,6 +1524,21 @@
+ 	if (nvme_qpair_is_admin_queue(qpair)) {
+ 		nvme_pcie_admin_qpair_destroy(qpair);
+ 	}
++	if (pqpair->inv_flags & INV_F_TRFREE) {
++		/* inv 20-l1-trfree: the §4 L evidence. Every cid back on the stack and no extra
++		 * push = every trfree IO submitted was completed exactly once. */
++		uint32_t lost = pqpair->inv_cid_cap - pqpair->inv_cid_top;
++
++		if (lost == 0 && pqpair->inv_cid_extra == 0) {
++			fprintf(stderr, "INV_TRFREE qid=%u all %u cids returned at destroy\n",
++				qpair->id, pqpair->inv_cid_cap);
++		} else {
++			NVME_QPAIR_ERRLOG(qpair, "INV_TRFREE qid=%u at destroy: %u cids "
++					  "not returned (lost IO), %" PRIu64 " extra cids "
++					  "(duplicate completions)\n",
++					  qpair->id, lost, pqpair->inv_cid_extra);
++		}
++	}
+ 	/*
+ 	 * We check sq_vaddr and cq_vaddr to see if the user specified the memory
+ 	 * buffers when creating the I/O queue.
+@@ -1392,6 +1551,8 @@
+ 	if (!pqpair->cq_vaddr && pqpair->cpl) {
+ 		spdk_free(pqpair->cpl);
+ 	}
++	free(pqpair->inv_cid_stack);
++	pqpair->inv_cid_stack = NULL;
+ 	if (pqpair->tr) {
+ 		spdk_free(pqpair->tr);
+ 	}
+@@ -2014,6 +2175,53 @@
+ 	return -EINVAL;
+ }
+ 
++/* inv 20-l1-trfree: no tracker, no outstanding list; the cid comes from the LIFO stack and req
++ * rides in the cb_fn slot (w4), which the unchanged device echoes in record w0. UNSAFE: in-flight
++ * IO cannot be aborted. A request the descriptor cannot carry fails loudly (no stock fallback:
++ * its tracker cid would collide with the stack's cids). */
++static int __attribute__((noinline))
++inv_trfree_submit(struct spdk_nvme_qpair *qpair, struct nvme_request *req)
++{
++	struct nvme_pcie_qpair *pqpair = nvme_pcie_qpair(qpair);
++	struct nvme_uncore_sq_desc_d *ring_d = (struct nvme_uncore_sq_desc_d *)pqpair->sq_desc_ring;
++	uint32_t _idx = pqpair->sq_desc_tail;
++	bool rw = req->cmd.opc == SPDK_NVME_OPC_READ || req->cmd.opc == SPDK_NVME_OPC_WRITE;
++
++	if (spdk_unlikely(req->payload_size > 131072u || !rw)) {
++		static bool inv_warned;
++
++		if (!inv_warned) {
++			inv_warned = true;
++			NVME_QPAIR_ERRLOG(qpair, "inv trfree: oracle cannot service this request "
++					  "(opc=0x%x payload_size=%u)\n", req->cmd.opc,
++					  req->payload_size);
++		}
++		return -ENOTSUP;
++	}
++	if (spdk_unlikely(pqpair->inv_cid_top == 0)) {
++		pqpair->stat->queued_requests++;
++		return -EAGAIN;
++	}
++	req->cmd.cid = pqpair->inv_cid_stack[--pqpair->inv_cid_top];
++	pqpair->stat->submitted_requests++;
++	pqpair->qpair.queue_depth++;
++	ring_d[_idx].w0 = ((uint64_t)(req->cmd.opc & 0xFFu) << 56) |
++			  ((uint64_t)(req->cmd.fuse & 0xFFu) << 48) |
++			  ((uint64_t)req->cmd.cid << 32) |
++			  ((uint64_t)(req->cmd.cdw12 & 0xFFFFu) << 16) |
++			  ((uint64_t)((req->cmd.cdw12 >> 16) & 0xFFFFu));
++	ring_d[_idx].w1 = (uint64_t)req->cmd.cdw10 | ((uint64_t)req->cmd.cdw11 << 32);
++	ring_d[_idx].w2 = 0;
++	ring_d[_idx].w3 = (uint64_t)(uintptr_t)req->cb_arg;
++	ring_d[_idx].w4 = (uint64_t)(uintptr_t)req;
++	pqpair->sq_desc_tail = (_idx + 1 == pqpair->num_entries) ? 0 : _idx + 1;
++	if (!pqpair->flags.delay_cmd_submit) {
++		nvme_pcie_qpair_ring_sq_doorbell(qpair);
++		pqpair->last_sq_desc_tail = pqpair->sq_desc_tail;
++	}
++	return 0;
++}
++
+ int
+ nvme_pcie_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request *req)
+ {
+@@ -2026,6 +2234,10 @@
+ 	bool			mptr_sgl_supported;
+ 	bool			dword_aligned = true;
+ 
++	if (spdk_unlikely(pqpair->inv_flags & INV_F_TRFREE)) {
++		return inv_trfree_submit(qpair, req);
++	}
++
+ 	if (spdk_unlikely(nvme_qpair_is_admin_queue(qpair))) {
+ 		nvme_ctrlr_lock(ctrlr);
+ 	}
+diff -ruN a/lib/nvme/nvme_pcie_internal.h b/lib/nvme/nvme_pcie_internal.h
+--- a/lib/nvme/nvme_pcie_internal.h	2026-10-14 00:51:48.095179416 +0000
++++ b/lib/nvme/nvme_pcie_internal.h	2026-10-14 00:52:02.287679409 +0000
+@@ -306,6 +306,21 @@
+ 	NVME_PCIE_QPAIR_FAILED,
+ };
+ 
++/*
++ * inv lever architecture (I4 oracles; 20-l1-trfree introduces it, every later lever follows it).
++ * Goal: with every lever env unset, the inv-levers hot paths equal inv-stock.
++ * - One hot byte, inv_flags, sits in the 2-byte hole after `flags`, so no stock field moves
++ *   (offsetof(qpair) is locked by the static assert after the struct).
++ * - Its INV_F_* bits are set once, at IO qpair construct, from the env; 0 = every lever off.
++ * - All other lever state lives at the struct tail.
++ * - Stock hot paths test inv_flags once (one load + branch per poll, per submit) and divert to
++ *   noinline lever functions (the poll path through a cold trampoline, so GCC keeps the stock
++ *   block layout); the stock loops and the shared poll tail stay unchanged.
++ * - A lever whose bit reaches inv_process_completions() must handle its completions there.
++ */
++#define INV_F_TRFREE	0x01u	/* 20-l1-trfree: Mode D, cid stack, req rides in w4 */
++/* 0x02u..0x80u: later levers */
++
+ /* PCIe transport extensions for spdk_nvme_qpair */
+ struct nvme_pcie_qpair {
+ 	/* Submission queue tail doorbell */
+@@ -368,6 +383,8 @@
+ 		uint8_t disable_pcie_sgl_merge	: 1;
+ 	} flags;
+ 
++	uint8_t inv_flags;	/* inv lever bits (INV_F_*), set at construct; 0 = stock */
++
+ 	/*
+ 	 * Base qpair structure.
+ 	 * This is located after the hot data in this structure so that the important parts of
+@@ -424,8 +441,21 @@
+ 	uint64_t  free_slot_ring_bus_addr;
+ 	uint32_t  free_slot_head;
+ 	uint8_t   free_slot_phase;
++
++	/* inv lever state (tail; see the architecture note above). */
++	/* 20-l1-trfree: compact LIFO cid stack, valid when inv_flags & INV_F_TRFREE. */
++	uint64_t inv_cid_extra;		/* completions whose cid found the stack full */
++	uint16_t *inv_cid_stack;
++	uint32_t inv_cid_top;
++	uint32_t inv_cid_cap;
+ };
+ 
++#ifdef SPDK_NVME_IO_CYCLE_OFF
++/* inv: lever state must not move a stock field (lean layout: flags at 109, qpair at 112). */
++SPDK_STATIC_ASSERT(offsetof(struct nvme_pcie_qpair, inv_flags) == 110, "inv_flags left the hole");
++SPDK_STATIC_ASSERT(offsetof(struct nvme_pcie_qpair, qpair) == 112, "inv: stock hot layout moved");
++#endif
++
+ static inline struct nvme_pcie_qpair *
+ nvme_pcie_qpair(struct spdk_nvme_qpair *qpair)
+ {

@@ -1,0 +1,617 @@
+# inv-patch: 23-l3-rec
+# purpose: L3 oracle, Mode D record density (spec I4 L3, H7): IAU_INV_REC_BYTES=16|32|64 sets the completion-callback record size on both sides (nvmf_tgt reads it once at transport create in iau_inv_rec_init(); the host library reads it at load time; same strtoll rule, any other value = the LOCKED 32 B). Layouts in 64-bit words, phase word written last: 32 B = LOCKED {cb_fn, cb_arg, cpl[0:8), cpl[8:16) with the ring phase at bit 48}, 2 per 64 B line; 16 B = {cb_arg, cpl[8:16)} with the ring phase at bit 48 (sqhd, sqid, cid, status: every field a Mode D completion uses), cb_fn kept once per qpair on the host (inv_cb_fn), 4 per line; 64 B = the 32 B record plus 32 B of padding never written or read, 1 per line. Target: iau_flush() keeps the original 32 B loop (instruction-identical at -O2 plus one load+compare+not-taken branch) and tail-calls an out-of-line 16/64 B flush; the record-ring map length is qsize x the size. Host (20's inv_flags architecture): the record ring is allocated at num_entries x the size; 16, exactly 32 and 64 set INV_F_REC16/INV_F_REC32/INV_F_REC64 on Mode D IO qpairs, so their completions run in inv_process_completions (inv_rec_pop and the record loops take a constant word count, dispatched once per poll). INV_F_REC32 is the L3 control: the LOCKED 32 B record through the same lever dispatch and loop shape as 16/64 B, so read rec16/rec64 against rec32 (the record-density effect) and rec32 against unset (the lever dispatch cost). The levers compose with 20 (trfree: with 16 B records the descriptor's w3 carries req, the record's w0 echoes it, cb_fn/cb_arg come from req) and 22 (I-thin: the thin read registers the qpair's cb_fn through a cold tail call); the tracker path (no 20/22) runs a copy of the stock lean Mode D loop that calls inv_cb_fn, registered at the first completion from the tr->cb_fn the unchanged stock submit stores (same line as tr->req) and checked against it per IO. With the env unset no bit is set, nvme_pcie_qpair_submit_request and nvme_pcie_qpair_process_completions compile to the same instructions as before (only __LINE__ immediates differ) and stock nvme_pcie_qpair offsets are unchanged (inv_cb_fn and inv_rec_logged at the tail)
+# safety: SAFE for this workload (perf reads, one cb_fn per qpair, cdw0 unused); the record format != the LOCKED RTL/gem5 format (overlay only, never in spdk/)
+# breaks: 16 B drops cpl dword0 (cdw0 + reserved; the host passes 0) and requires one cb_fn per qpair: a second cb_fn aborts the process (tracker path at its completion, before the callback runs; I-thin at its submit); record format != the LOCKED RTL format (overlay only); nvmf_tgt and the host must see the same IAU_INV_REC_BYTES (run_point exports it to both): a disagreement misparses every record and usually hangs perf (no timeout; it can also crash on a garbage callback), and check_l.py FAILs the point when the target's INV_REC line is missing, carries another env value, or gives other bytes than the host's construct lines; Mode D only (mode 0 ignores it); a host qpair with Mode E and a size other than 32 fails construct with -ENOTSUP; per-IO cycle records are not taken on the lever loops (non-lean builds only); oracle overhead the design would not pay: the per-IO tr->cb_fn check (16 B tracker path), one inv_flags test in 20's trfree submit and one in 22's thin read, one size dispatch per poll (lever loops, bounded by the rec32 control) and one load+compare per target flush. §4 L evidence (printed only when IAU_INV_REC_BYTES is non-empty, the target's rule): host "INV_REC qid=N bytes=B per_line=K inv_flags=0xNN" per Mode D IO qpair at construct and, at destroy, "INV_REC qid=N all K cids returned at destroy (bytes=B cb_fn=P)" only when that qpair's cid pool is whole (thin stack, else trfree stack, else every tracker on free_tr and outstanding_tr empty), else an ERROR line with "lost IO"; target "INV_REC target: env=V bytes=B per_line=K" at transport create; check_l.py expects one destroy line per qpair in mode 4 and the size agreement above
+# env: IAU_INV_REC_BYTES=16|32|64, read by BOTH nvmf_tgt and the host (default 32; exactly 32 = the rec32 lever-loop control, unset = stock loops)
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff,12-residue.diff,13-iport.diff,20-l1-trfree.diff,22-l2-thin.diff
+diff -ruN a/lib/nvme/nvme_pcie_common.c b/lib/nvme/nvme_pcie_common.c
+--- a/lib/nvme/nvme_pcie_common.c	2026-10-14 01:09:23.185138414 +0000
++++ b/lib/nvme/nvme_pcie_common.c	2026-10-14 01:31:10.955950543 +0000
+@@ -35,6 +35,21 @@
+ 
+ static int64_t g_inv_trfree = -1;
+ static int64_t g_inv_thin = -1;
++static int64_t g_inv_rec_bytes = -1;	/* IAU_INV_REC_BYTES (strtoll); 0 = unset or empty */
++static int g_inv_rec_env_set = -1;	/* IAU_INV_REC_BYTES non-empty; -1 = unread */
++
++/* inv 23-l3-rec: the env is set when it is non-empty: nvmf_tgt's rule for printing its INV_REC
++ * line, so the host prints its lines under exactly the same condition. */
++static inline bool
++inv_rec_env_set(void)
++{
++	if (spdk_unlikely(g_inv_rec_env_set < 0)) {
++		const char *e = getenv("IAU_INV_REC_BYTES");
++
++		g_inv_rec_env_set = (e != NULL && e[0] != '\0');
++	}
++	return g_inv_rec_env_set == 1;
++}
+ 
+ /* inv: read every lever env once at load time, on the main thread, so no worker thread
+  * fills a cache lazily; qpair construct then turns the values into inv_flags bits. */
+@@ -43,6 +58,22 @@
+ {
+ 	inv_env_i64("SPDK_INV_TRFREE", &g_inv_trfree, 0);
+ 	inv_env_i64("SPDK_INV_THIN", &g_inv_thin, 0);
++	inv_env_i64("IAU_INV_REC_BYTES", &g_inv_rec_bytes, 0);
++	(void)inv_rec_env_set();
++}
++
++SPDK_STATIC_ASSERT(sizeof(struct nvme_uncore_cq_cb_rec) == 32, "LOCKED Mode D record is 32 B");
++SPDK_STATIC_ASSERT(offsetof(struct nvme_uncore_cq_cb_rec, cpl_hi) == 24, "Mode D phase word is w3");
++
++/* inv 23-l3-rec: the Mode D record size, IAU_INV_REC_BYTES = 16|32|64; unset or any other value
++ * = the LOCKED 32 B record. nvmf_tgt parses the same env with the same rule (iau_inv_rec_init),
++ * so host and target agree on the ring layout. Called at IO qpair construct only. */
++static inline uint32_t
++inv_rec_bytes(void)
++{
++	int64_t v = inv_env_i64("IAU_INV_REC_BYTES", &g_inv_rec_bytes, 0);
++
++	return (v == 16 || v == 64) ? (uint32_t)v : (uint32_t)sizeof(struct nvme_uncore_cq_cb_rec);
+ }
+ 
+ static void nvme_pcie_fail_request_bad_vtophys(struct spdk_nvme_qpair *qpair,
+@@ -321,7 +352,9 @@
+ 		 * so uncore_mode_c() is also true here — pick sizes by uncore_mode_d(). */
+ 		size_t sq_elem = uncore_mode_d() ? sizeof(struct nvme_uncore_sq_desc_d)
+ 						 : sizeof(struct nvme_uncore_sq_desc);
+-		size_t cq_elem = uncore_mode_d() ? sizeof(struct nvme_uncore_cq_cb_rec)
++		/* inv 23-l3-rec: inv_rec_bytes() = 32 = sizeof(struct nvme_uncore_cq_cb_rec) unless
++		 * IAU_INV_REC_BYTES is 16 or 64; the target maps qsize * the same size. */
++		size_t cq_elem = uncore_mode_d() ? (size_t)inv_rec_bytes()
+ 						 : sizeof(struct nvme_uncore_cq_rec);
+ 		size_t sq_ring_len = pqpair->num_entries * sq_elem;
+ 		size_t cq_ring_len = pqpair->num_entries * cq_elem;
+@@ -500,6 +533,41 @@
+ 		}
+ 	}
+ 
++	/* inv 23-l3-rec: the record ring above was sized from the same knob. Unset (or a value
++	 * other than 16|32|64) keeps the stock loops (no bit). 16/64 B set a bit, and so does
++	 * exactly 32 (INV_F_REC32, the control: the LOCKED 32 B record through the same lever
++	 * dispatch and loop shape as 16/64 B), so this qpair's completions run in the lever loops,
++	 * composed with 20 (trfree) or 22 (I-thin) when those are on. Set after 22, which assigns
++	 * inv_flags. The poll's mode_d test (Mode D, record ring, IO qpair) is the same condition. */
++	pqpair->inv_cb_fn = NULL;
++	pqpair->inv_rec_logged = 0;
++	if (qpair->id != 0 && uncore_mode_d() && pqpair->cq_rec_ring != NULL) {
++		uint32_t rb = inv_rec_bytes();
++		int64_t v = inv_env_i64("IAU_INV_REC_BYTES", &g_inv_rec_bytes, 0);
++
++		if (rb != sizeof(struct nvme_uncore_cq_cb_rec) && uncore_mode_e()) {
++			NVME_QPAIR_ERRLOG(qpair, "inv 23: IAU_INV_REC_BYTES=%u needs Mode D without "
++					  "Mode E\n", rb);
++			return -ENOTSUP;
++		}
++		if (v == 16) {
++			pqpair->inv_flags |= INV_F_REC16;
++		} else if (v == 32) {
++			pqpair->inv_flags |= INV_F_REC32;
++		} else if (v == 64) {
++			pqpair->inv_flags |= INV_F_REC64;
++		}
++		if (inv_rec_env_set()) {
++			/* §4 L evidence: the size this IO qpair polls; check_l.py balances it against
++			 * the destroy line and compares the bytes with nvmf_tgt's INV_REC line. */
++			pqpair->inv_rec_logged = (uint8_t)rb;
++			fprintf(stderr, "INV_REC qid=%u bytes=%u per_line=%u inv_flags=0x%02x%s\n",
++				qpair->id, rb, 64u / rb, pqpair->inv_flags,
++				(v == 16 || v == 32 || v == 64) ? "" :
++				" (value not 16|32|64: LOCKED 32 B kept)");
++		}
++	}
++
+ 	nvme_pcie_qpair_reset(qpair);
+ 
+ 	return 0;
+@@ -1141,23 +1209,48 @@
+ 	}
+ }
+ 
+-/* inv: consume one Mode D record exactly like the stock loop (phase bit, the four words in the
+- * stock order, cursor advance with phase toggle). Returns false when no new record is visible. */
+-static inline bool
+-inv_rec_pop(struct nvme_pcie_qpair *pqpair, uint64_t *cb_fn, uint64_t *cb_arg, uint64_t *cpl_lo,
+-	    uint64_t *cpl_hi)
++/* inv 23-l3-rec: a 16 B record carries no cb_fn, so a 16 B-record qpair runs on exactly one, kept
++ * in inv_cb_fn (the per-queue register of the 16 B design). The first IO registers it: the I-thin
++ * submit, or on the tracker path the first completion, from the tr->cb_fn the stock submit
++ * stored. A second, different cb_fn lands here before any callback runs with it, and aborts. */
++static void __attribute__((noinline, cold))
++inv_rec16_register(struct nvme_pcie_qpair *pqpair, spdk_nvme_cmd_cb cb_fn)
+ {
+-	volatile struct nvme_uncore_cq_cb_rec *ring =
+-		(volatile struct nvme_uncore_cq_cb_rec *)pqpair->cq_rec_ring;
+-	volatile struct nvme_uncore_cq_cb_rec *rec = &ring[pqpair->cq_rec_head];
+-	uint64_t hi = rec->cpl_hi;
++	if (pqpair->inv_cb_fn != NULL) {
++		NVME_QPAIR_ERRLOG(&pqpair->qpair, "inv 23: 16 B records need one cb_fn per qpair "
++				  "(%p, then %p)\n", (void *)pqpair->inv_cb_fn, (void *)cb_fn);
++		abort();
++	}
++	pqpair->inv_cb_fn = cb_fn;
++}
++
++/* inv: consume one Mode D record exactly like the stock loop (phase bit, the four words in the
++ * stock order, cursor advance with phase toggle). Returns false when no new record is visible.
++ * inv 23-l3-rec: words = record bytes / 8, a constant in every caller (always_inline):
++ *   4 = the LOCKED 32 B record, read as before: w3 (phase) first, then w0, w1, w2;
++ *   8 = 64 B: the same four words at a 64 B stride (w4..w7 padding, never read);
++ *   2 = 16 B: w1 (phase) first, then w0 = cb_arg; cb_fn = the qpair's inv_cb_fn (the caller
++ *       ignores it on the trfree path), cpl bytes [0:8) = 0 (nvme_pcie_internal.h layouts). */
++static inline __attribute__((always_inline)) bool
++inv_rec_pop(struct nvme_pcie_qpair *pqpair, const uint32_t words, uint64_t *cb_fn,
++	    uint64_t *cb_arg, uint64_t *cpl_lo, uint64_t *cpl_hi)
++{
++	volatile uint64_t *recw = (volatile uint64_t *)pqpair->cq_rec_ring +
++				  (size_t)pqpair->cq_rec_head * words;
++	uint64_t hi = recw[words == 2 ? 1 : 3];
+ 
+ 	if (((uint8_t)((hi >> 48) & 0x1u)) != pqpair->cq_rec_phase) {
+ 		return false;
+ 	}
+-	*cb_fn = rec->cb_fn;
+-	*cb_arg = rec->cb_arg;
+-	*cpl_lo = rec->cpl_lo;
++	if (words == 2) {
++		*cb_fn = (uint64_t)(uintptr_t)pqpair->inv_cb_fn;
++		*cb_arg = recw[0];
++		*cpl_lo = 0;
++	} else {
++		*cb_fn = recw[0];
++		*cb_arg = recw[1];
++		*cpl_lo = recw[2];
++	}
+ 	*cpl_hi = hi;
+ 	if (spdk_unlikely(++pqpair->cq_rec_head == pqpair->num_entries)) {
+ 		pqpair->cq_rec_head = 0;
+@@ -1166,15 +1259,18 @@
+ 	return true;
+ }
+ 
+-/* inv 20-l1-trfree: record w0 echoes the nvme_request (descriptor w4); no tracker is touched. */
+-static uint32_t
+-inv_records_trfree(struct nvme_pcie_qpair *pqpair, uint32_t max_completions)
++/* inv 20-l1-trfree: record w0 echoes the nvme_request (descriptor w4); no tracker is touched.
++ * inv 23 (words == 2, 16 B records): the descriptor's w3 carries req, so the record's w0 (cb_arg)
++ * is req and the callback takes cb_fn and cb_arg from req. */
++static inline __attribute__((always_inline)) uint32_t
++inv_records_trfree(struct nvme_pcie_qpair *pqpair, uint32_t max_completions, const uint32_t words)
+ {
+ 	uint64_t rec_cb_fn, rec_cb_arg, cpl_lo, cpl_hi;
+ 	uint32_t num_completions = 0;
+ 
+-	while (inv_rec_pop(pqpair, &rec_cb_fn, &rec_cb_arg, &cpl_lo, &cpl_hi)) {
+-		struct nvme_request *req = (struct nvme_request *)(uintptr_t)rec_cb_fn;
++	while (inv_rec_pop(pqpair, words, &rec_cb_fn, &rec_cb_arg, &cpl_lo, &cpl_hi)) {
++		struct nvme_request *req =
++			(struct nvme_request *)(uintptr_t)(words == 2 ? rec_cb_arg : rec_cb_fn);
+ 		uint16_t cid = (uint16_t)((cpl_hi >> 32) & 0xFFFFu);
+ 		struct spdk_nvme_cpl cpl_rec;
+ 
+@@ -1188,7 +1284,11 @@
+ 			pqpair->inv_cid_extra++;
+ 		}
+ 		pqpair->qpair.queue_depth--;
+-		req->cb_fn((void *)(uintptr_t)rec_cb_arg, &cpl_rec);
++		if (words == 2) {
++			req->cb_fn(req->cb_arg, &cpl_rec);
++		} else {
++			req->cb_fn((void *)(uintptr_t)rec_cb_arg, &cpl_rec);
++		}
+ 		nvme_free_request(req);
+ 		if (++num_completions == max_completions) {
+ 			break;
+@@ -1209,14 +1309,15 @@
+ 	}
+ }
+ 
+-/* inv 22-l2-thin (I-thin): the record carries the callback; recycle the cid, call back. */
+-static uint32_t
+-inv_records_ithin(struct nvme_pcie_qpair *pqpair, uint32_t max_completions)
++/* inv 22-l2-thin (I-thin): the record carries the callback; recycle the cid, call back.
++ * inv 23 (words == 2): cb_fn is the qpair's inv_cb_fn, registered by the thin submit. */
++static inline __attribute__((always_inline)) uint32_t
++inv_records_ithin(struct nvme_pcie_qpair *pqpair, uint32_t max_completions, const uint32_t words)
+ {
+ 	uint64_t rec_cb_fn, rec_cb_arg, cpl_lo, cpl_hi;
+ 	uint32_t num_completions = 0;
+ 
+-	while (inv_rec_pop(pqpair, &rec_cb_fn, &rec_cb_arg, &cpl_lo, &cpl_hi)) {
++	while (inv_rec_pop(pqpair, words, &rec_cb_fn, &rec_cb_arg, &cpl_lo, &cpl_hi)) {
+ 		struct spdk_nvme_cpl cpl_rec;
+ 
+ 		memcpy((uint8_t *)&cpl_rec + 0, &cpl_lo, 8);
+@@ -1285,6 +1386,52 @@
+ 	return num_completions;
+ }
+ 
++/* inv 23-l3-rec: the stock Mode D completion loop (tracker by cid, lean recycle, the record's
++ * callback) for 16 B, 64 B and the 32 B control (INV_F_REC32); qpairs without a rec bit run the
++ * stock loop itself. Same steps in the same order as the stock loop of the lean build; per-IO
++ * cycle records are not taken here.
++ * 16 B: the callback is the qpair's inv_cb_fn. It is checked against tr->cb_fn, which the
++ * unchanged stock submit stores on the tracker line this loop already reads (tr->req), so the
++ * stock submit needs no lever code; the first completion registers it. */
++static inline __attribute__((always_inline)) uint32_t
++inv_records_tr(struct nvme_pcie_qpair *pqpair, uint32_t max_completions, const uint32_t words)
++{
++	uint64_t rec_cb_fn, rec_cb_arg, cpl_lo, cpl_hi;
++	uint32_t num_completions = 0;
++
++	while (inv_rec_pop(pqpair, words, &rec_cb_fn, &rec_cb_arg, &cpl_lo, &cpl_hi)) {
++		struct nvme_tracker *tr = &pqpair->tr[(uint16_t)((cpl_hi >> 32) & 0xFFFFu)];
++
++		if (spdk_likely(tr->req != NULL)) {
++			struct nvme_request *req = tr->req;
++			struct spdk_nvme_cpl cpl_rec;
++
++			if (words == 2) {
++				if (spdk_unlikely(tr->cb_fn != pqpair->inv_cb_fn)) {
++					inv_rec16_register(pqpair, tr->cb_fn);
++				}
++				rec_cb_fn = (uint64_t)(uintptr_t)pqpair->inv_cb_fn;
++			}
++			memcpy((uint8_t *)&cpl_rec + 0, &cpl_lo, 8);
++			memcpy((uint8_t *)&cpl_rec + 8, &cpl_hi, 8);
++			TAILQ_REMOVE(&pqpair->outstanding_tr, tr, tq_list);
++			pqpair->qpair.queue_depth--;
++			((spdk_nvme_cmd_cb)(uintptr_t)rec_cb_fn)((void *)(uintptr_t)rec_cb_arg, &cpl_rec);
++			nvme_free_request(req);
++			tr->req = NULL;
++			TAILQ_INSERT_HEAD(&pqpair->free_tr, tr, tq_list);
++		} else {
++			NVME_QPAIR_ERRLOG(&pqpair->qpair,
++					  "mode-D cq record cid does not map to outstanding cmd\n");
++			assert(0);
++		}
++		if (++num_completions == max_completions) {
++			break;
++		}
++	}
++	return num_completions;
++}
++
+ static void __attribute__((noinline, cold))
+ inv_no_completion_path(struct nvme_pcie_qpair *pqpair, uint8_t inv, bool mode_d)
+ {
+@@ -1305,16 +1452,39 @@
+ inv_process_completions(struct nvme_pcie_qpair *pqpair, uint32_t max_completions, bool mode_d,
+ 			uint8_t inv)
+ {
++	/* inv 23-l3-rec: the record size is dispatched once per poll; each record loop below is
++	 * instantiated with a constant word count (2 = 16 B, 4 = LOCKED 32 B, 8 = 64 B). */
+ 	if (inv & INV_F_THIN) {
+ 		if (mode_d && (inv & INV_F_ITHIN)) {
+-			return inv_records_ithin(pqpair, max_completions);
++			if (inv & INV_F_REC16) {
++				return inv_records_ithin(pqpair, max_completions, 2);
++			}
++			if (inv & INV_F_REC64) {
++				return inv_records_ithin(pqpair, max_completions, 8);
++			}
++			return inv_records_ithin(pqpair, max_completions, 4);
+ 		}
+ 		if (!mode_d && !(inv & INV_F_ITHIN)) {
+ 			return inv_cqes_bthin(pqpair, max_completions);
+ 		}
+ 	}
+ 	if (mode_d && (inv & INV_F_TRFREE)) {
+-		return inv_records_trfree(pqpair, max_completions);
++		if (inv & INV_F_REC16) {
++			return inv_records_trfree(pqpair, max_completions, 2);
++		}
++		if (inv & INV_F_REC64) {
++			return inv_records_trfree(pqpair, max_completions, 8);
++		}
++		return inv_records_trfree(pqpair, max_completions, 4);
++	}
++	if (mode_d && (inv & (INV_F_REC16 | INV_F_REC32 | INV_F_REC64))) {
++		if (inv & INV_F_REC16) {
++			return inv_records_tr(pqpair, max_completions, 2);
++		}
++		if (inv & INV_F_REC64) {
++			return inv_records_tr(pqpair, max_completions, 8);
++		}
++		return inv_records_tr(pqpair, max_completions, 4);	/* INV_F_REC32 control */
+ 	}
+ 	inv_no_completion_path(pqpair, inv, mode_d);
+ 	return 0;
+@@ -1708,6 +1878,46 @@
+ 	free(pqpair->inv_thin_stack);
+ 	pqpair->inv_thin = NULL;
+ 	pqpair->inv_thin_stack = NULL;
++	if (pqpair->inv_rec_logged != 0) {
++		/* inv 23-l3-rec: the §4 L evidence, for every qpair that printed an INV_REC construct
++		 * line. The cid pool in use (22 thin stack, else 20 trfree stack, else the tracker
++		 * lists) must be whole: every IO submitted on this qpair completed exactly once.
++		 * cb_fn = the 16 B qpair's single registered callback (nil otherwise or without IO). */
++		uint32_t cap, avail = 0;
++		uint64_t extra = 0;
++		bool whole;
++
++		if (pqpair->inv_flags & INV_F_THIN) {
++			cap = pqpair->inv_thin_cap;
++			avail = pqpair->inv_thin_top;
++			extra = pqpair->inv_thin_extra;
++			whole = true;
++		} else if (pqpair->inv_flags & INV_F_TRFREE) {
++			cap = pqpair->inv_cid_cap;
++			avail = pqpair->inv_cid_top;
++			extra = pqpair->inv_cid_extra;
++			whole = true;
++		} else {
++			struct nvme_tracker *t;
++
++			cap = (uint32_t)(pqpair->num_entries - pqpair->max_completions_cap);
++			TAILQ_FOREACH(t, &pqpair->free_tr, tq_list) {
++				avail++;
++			}
++			whole = TAILQ_EMPTY(&pqpair->outstanding_tr);
++		}
++		if (whole && avail == cap && extra == 0) {
++			fprintf(stderr, "INV_REC qid=%u all %u cids returned at destroy (bytes=%u "
++				"cb_fn=%p)\n", qpair->id, cap, pqpair->inv_rec_logged,
++				(void *)pqpair->inv_cb_fn);
++		} else {
++			NVME_QPAIR_ERRLOG(qpair, "INV_REC qid=%u at destroy: %u of %u cids free, "
++					  "outstanding list %s (lost IO), %" PRIu64 " extra cids "
++					  "(bytes=%u)\n", qpair->id, avail, cap,
++					  whole ? "empty" : "not empty", extra,
++					  pqpair->inv_rec_logged);
++		}
++	}
+ 	if (pqpair->tr) {
+ 		spdk_free(pqpair->tr);
+ 	}
+@@ -2367,7 +2577,10 @@
+ 			  ((uint64_t)((req->cmd.cdw12 >> 16) & 0xFFFFu));
+ 	ring_d[_idx].w1 = (uint64_t)req->cmd.cdw10 | ((uint64_t)req->cmd.cdw11 << 32);
+ 	ring_d[_idx].w2 = 0;
+-	ring_d[_idx].w3 = (uint64_t)(uintptr_t)req->cb_arg;
++	/* inv 23: a 16 B record echoes only w3, so req rides there too (the completion then takes
++	 * cb_fn and cb_arg from req). */
++	ring_d[_idx].w3 = (pqpair->inv_flags & INV_F_REC16) ? (uint64_t)(uintptr_t)req :
++			  (uint64_t)(uintptr_t)req->cb_arg;
+ 	ring_d[_idx].w4 = (uint64_t)(uintptr_t)req;
+ 	pqpair->sq_desc_tail = (_idx + 1 == pqpair->num_entries) ? 0 : _idx + 1;
+ 	if (!pqpair->flags.delay_cmd_submit) {
+@@ -2577,6 +2790,17 @@
+ 	return -ENXIO;
+ }
+ 
++/* inv 23-l3-rec (I-thin, 16 B records): the record carries no cb_fn and I-thin has no tracker to
++ * check one against, so the thin submit registers the qpair's single cb_fn (a second, different
++ * one aborts) and then re-enters the thin read. */
++static int __attribute__((noinline, cold))
++inv_rec16_thin_first(struct spdk_nvme_qpair *qpair, uint32_t nsid, uint64_t lba, uint32_t nlb,
++		     uint64_t buf_iova, spdk_nvme_cmd_cb cb_fn, void *cb_arg)
++{
++	inv_rec16_register(nvme_pcie_qpair(qpair), cb_fn);
++	return spdk_nvme_inv_thin_read(qpair, nsid, lba, nlb, buf_iova, cb_fn, cb_arg);
++}
++
+ /* One read, no nvme_request, no tracker. I-thin (Mode D) writes the stock-packed descriptor;
+  * B-thin keeps the callback in the per-cid context and writes the SQE. Both take the cid from
+  * the same LIFO stack and batch the SQ doorbell exactly like their stock paths. UNSAFE oracle. */
+@@ -2591,6 +2815,11 @@
+ 	if (spdk_unlikely(!(inv & INV_F_THIN))) {
+ 		return inv_thin_missing(qpair);
+ 	}
++	if (spdk_unlikely((inv & INV_F_REC16) && pqpair->inv_cb_fn != cb_fn)) {
++		/* inv 23 (I-thin, 16 B records): first IO or a second cb_fn; a tail call, so the
++		 * thin path keeps its code. */
++		return inv_rec16_thin_first(qpair, nsid, lba, nlb, buf_iova, cb_fn, cb_arg);
++	}
+ 	if (spdk_unlikely(pqpair->inv_thin_top == 0)) {
+ 		pqpair->stat->queued_requests++;
+ 		return -EAGAIN;
+diff -ruN a/lib/nvme/nvme_pcie_internal.h b/lib/nvme/nvme_pcie_internal.h
+--- a/lib/nvme/nvme_pcie_internal.h	2026-10-14 01:09:23.185716185 +0000
++++ b/lib/nvme/nvme_pcie_internal.h	2026-10-14 01:31:21.303527762 +0000
+@@ -321,7 +321,33 @@
+ #define INV_F_TRFREE	0x01u	/* 20-l1-trfree: Mode D, cid stack, req rides in w4 */
+ #define INV_F_THIN	0x02u	/* 22-l2-thin: B-thin or I-thin (thin state allocated) */
+ #define INV_F_ITHIN	0x04u	/* 22-l2-thin: I-thin (Mode D descriptors and records) */
+-/* 0x08u..0x80u: later levers */
++#define INV_F_REC16	0x08u	/* 23-l3-rec: 16 B Mode D records; cb_fn = inv_cb_fn */
++#define INV_F_REC64	0x10u	/* 23-l3-rec: 64 B Mode D records (one per line) */
++#define INV_F_REC32	0x20u	/* 23-l3-rec: LOCKED 32 B records through the lever loops (control) */
++/* 0x40u..0x80u: later levers */
++
++/*
++ * inv 23-l3-rec (oracle, spec I4 L3; record format != the LOCKED RTL/gem5 format, overlay only).
++ * IAU_INV_REC_BYTES = 16|32|64 (strtoll; anything else or unset = 32) sets the Mode D record size
++ * for the host library and, with the same rule, for nvmf_tgt (lib/nvmf/vfio_user_iau.h). Layouts,
++ * in 64-bit words, phase word written last by the device:
++ *   32 B (LOCKED, struct nvme_uncore_cq_cb_rec): w0 cb_fn, w1 cb_arg, w2 cpl bytes [0:8),
++ *        w3 cpl bytes [8:16) with the ring phase at bit 48. Unset: stock loops, no inv bit.
++ *        Exactly 32 (INV_F_REC32): the same record through the lever dispatch and loops, the
++ *        control for 16/64 B (rec32 vs off bounds the lever dispatch cost).
++ *   16 B (INV_F_REC16): w0 cb_arg, w1 = the 32 B record's w3: sqhd[15:0], sqid[31:16], cid[47:32],
++ *        status[63:49], ring phase at bit 48. That is every field a Mode D completion uses: the
++ *        phase (poll), cid (tracker or cid-stack recycle) and status (sc/sct, the callback's
++ *        error check); sqhd is carried but unused (Mode D never reads it). Dropped: cb_fn (one
++ *        per qpair, inv_cb_fn: registered by the first completion from tr->cb_fn on the
++ *        tracker path, which then checks every IO against it, or by the first I-thin submit;
++ *        a second cb_fn aborts before it runs) and cpl bytes [0:8) (cdw0 + reserved: the
++ *        target always sends 0 and a read completion carries none; the host passes 0). With
++ *        20-l1-trfree the descriptor's w3 carries req instead of cb_arg, so the record's w0 is
++ *        req and cb_fn/cb_arg come from req. 4 per 64 B line.
++ *   64 B (INV_F_REC64): the 32 B record in w0..w3; w4..w7 are padding, never written or read.
++ *        1 per 64 B line.
++ */
+ 
+ /* inv 22-l2-thin (oracle): per-cid callback context for the thin baseline path (B-thin). */
+ struct inv_thin_ctx {
+@@ -463,6 +489,8 @@
+ 	uint32_t inv_thin_top;
+ 	uint32_t inv_thin_cap;
+ 	uint64_t inv_thin_extra;	/* completions whose cid found the stack full */
++	spdk_nvme_cmd_cb inv_cb_fn;	/* inv 23: the single cb_fn of a 16 B-record qpair */
++	uint8_t inv_rec_logged;		/* inv 23: bytes in this qpair's INV_REC line; 0 = none */
+ };
+ 
+ /* inv 22-l2-thin: one read with no nvme_request and no tracker (UNSAFE oracle, see the patch
+diff -ruN a/lib/nvmf/vfio_user.c b/lib/nvmf/vfio_user.c
+--- a/lib/nvmf/vfio_user.c	2026-10-14 01:09:23.131306601 +0000
++++ b/lib/nvmf/vfio_user.c	2026-10-14 01:11:42.351731840 +0000
+@@ -1218,6 +1218,7 @@
+ 
+ 		vu_transport->pg_by_qid = (pg_env != NULL && pg_env[0] != '\0' && pg_env[0] != '0');
+ 	}
++	iau_inv_rec_init();	/* inv 23-l3-rec: IAU_INV_REC_BYTES, read once at target init */
+ 
+ 	if (opts->transport_specific != NULL &&
+ 	    spdk_json_decode_object_relaxed(opts->transport_specific, vfio_user_transport_opts_decoder,
+@@ -2156,7 +2157,7 @@
+ 					  (uint64_t)qsize * IAU_DESC_D_BYTES,
+ 					  sq->iau_sg_desc, &sq->iau_iov_desc, MAP_R);
+ 			rec_va = map_one(ctrlr->endpoint->vfu_ctx, rec_iova,
+-					 (uint64_t)qsize * IAU_REC_BYTES,
++					 (uint64_t)qsize * iau_inv_rec_bytes(),	/* inv 23 */
+ 					 sq->iau_sg_rec, &sq->iau_iov_rec, MAP_RW);
+ 			if (desc_va == NULL || rec_va == NULL) {
+ 				SPDK_ERRLOG("%s: IAU Mode D: failed to map rings of sqid:%u\n",
+diff -ruN a/lib/nvmf/vfio_user_iau.c b/lib/nvmf/vfio_user_iau.c
+--- a/lib/nvmf/vfio_user_iau.c	2026-10-14 01:09:23.139978575 +0000
++++ b/lib/nvmf/vfio_user_iau.c	2026-10-14 01:32:21.544112812 +0000
+@@ -1,6 +1,7 @@
+ /* SPDX-License-Identifier: BSD-3-Clause */
+ #include "spdk/stdinc.h"
+ #include "spdk/barrier.h"
++#include "spdk/likely.h"
+ #include "spdk/nvme_spec.h"
+ #include "vfio_user_iau.h"
+ #include "vfio_user_iau_record.h"
+@@ -154,12 +155,100 @@
+ 	sq->fetched++;
+ }
+ 
++/* inv 23-l3-rec: the Mode D record size (vfio_user_iau.h). Set once by iau_inv_rec_init() at
++ * transport create, before any SQ attaches, and read-only afterwards; without that call (unit
++ * tests) it stays the LOCKED 32 B. */
++static uint32_t g_iau_inv_rec_bytes = IAU_REC_BYTES;
++
++void
++iau_inv_rec_init(void)
++{
++	const char *e = getenv("IAU_INV_REC_BYTES");
++	long long v;
++
++	g_iau_inv_rec_bytes = IAU_REC_BYTES;
++	if (e == NULL || e[0] == '\0') {
++		return;		/* unset: the LOCKED 32 B record, no output */
++	}
++	v = strtoll(e, NULL, 10);	/* the host's rule (inv_env_i64), so both sides agree */
++	if (v == 16 || v == 64) {
++		g_iau_inv_rec_bytes = (uint32_t)v;
++	}
++	/* Stable format, parsed by scripts/realcore/inv/check_l.py (host/target size agreement). */
++	fprintf(stderr, "INV_REC target: env=%s bytes=%u per_line=%u%s\n", e, g_iau_inv_rec_bytes,
++		64u / g_iau_inv_rec_bytes,
++		(v == 16 || v == 32 || v == 64) ? "" : " (value not 16|32|64: LOCKED 32 B kept)");
++}
++
++uint32_t
++iau_inv_rec_bytes(void)
++{
++	return g_iau_inv_rec_bytes;
++}
++
++/* inv 23-l3-rec: publish every staged completion as one 16 B (words == 2) or 64 B (words == 8)
++ * record; 'words' is a constant in each instantiation. The 64 B record is the 32 B one at a 64 B
++ * stride, words 4..7 never written. */
++static inline __attribute__((always_inline)) void
++iau_inv_flush_words(struct iau_sq *sq, const uint32_t words)
++{
++	uint32_t i;
++
++	for (i = 0; i < sq->staged; i++) {
++		const struct iau_staged *st = &sq->staging[i];
++		volatile uint64_t *dst = &sq->rec_ring[(size_t)sq->rec_tail * words];
++		uint8_t rec[IAU_REC_BYTES];
++		uint64_t w[4];
++
++		iau_pack_moded_record(st->cb_fn, st->cb_arg, st->cpl_lo, st->cpl_hi_raw,
++				      sq->rec_phase, rec);
++		memcpy(w, rec, sizeof(w));
++		if (words == 2) {
++			dst[0] = w[1];	/* 16 B: cb_arg; the host keeps one cb_fn per queue */
++			spdk_wmb();	/* payload visible before the phase word the host polls */
++			dst[1] = w[3];	/* cpl bytes [8:16) with the ring phase at bit 48 */
++		} else {
++			dst[0] = w[0];
++			dst[1] = w[1];
++			dst[2] = w[2];
++			spdk_wmb();	/* payload visible before the phase word the host polls */
++			dst[3] = w[3];
++		}
++		if (++sq->rec_tail == sq->entries) {
++			sq->rec_tail = 0;
++			sq->rec_phase ^= 1;
++		}
++		sq->credits_in_use--;	/* RTL credit_inc: one slot returned per emitted record */
++		sq->emitted++;
++	}
++	sq->staged = 0;
++}
++
++/* inv 23-l3-rec: the 16 B / 64 B flush, out of line so iau_flush keeps the original 32 B loop
++ * (plus one load, compare and not-taken branch). Not cold: it is the hot flush of those arms.
++ * sq is the second argument and noipa keeps the signature, so iau_flush's tail call needs no
++ * register moves (ctx and sq already sit in the argument registers there). */
++static void __attribute__((noipa))
++iau_inv_flush_sized(struct iau_ctx *ctx, struct iau_sq *sq)
++{
++	(void)ctx;
++	if (g_iau_inv_rec_bytes == 16) {
++		iau_inv_flush_words(sq, 2);
++	} else {
++		iau_inv_flush_words(sq, 8);
++	}
++}
++
+ void
+ iau_flush(struct iau_ctx *ctx, uint16_t qid)
+ {
+ 	struct iau_sq *sq = &ctx->sq[qid];
+ 	uint32_t i;
+ 
++	if (spdk_unlikely(g_iau_inv_rec_bytes != IAU_REC_BYTES)) {
++		iau_inv_flush_sized(ctx, sq);	/* inv 23: 16 B or 64 B records (a tail call) */
++		return;
++	}
+ 	for (i = 0; i < sq->staged; i++) {
+ 		const struct iau_staged *st = &sq->staging[i];
+ 		volatile uint64_t *dst = &sq->rec_ring[(size_t)sq->rec_tail * 4];
+diff -ruN a/lib/nvmf/vfio_user_iau.h b/lib/nvmf/vfio_user_iau.h
+--- a/lib/nvmf/vfio_user_iau.h	2026-10-14 01:09:23.148580664 +0000
++++ b/lib/nvmf/vfio_user_iau.h	2026-10-14 01:31:46.362386826 +0000
+@@ -108,4 +108,25 @@
+ /* Publish every staged completion as a 32B record (w0..w2, wmb, w3). */
+ void iau_flush(struct iau_ctx *ctx, uint16_t qid);
+ 
++/*
++ * inv 23-l3-rec: investigation overlay oracle (spec I4 L3), NOT the LOCKED RTL/gem5 format.
++ * IAU_INV_REC_BYTES = 16|32|64 picks the Mode D record size; unset, empty or any other value
++ * keeps the LOCKED 32 B record, written exactly as before. The host library parses the same env
++ * with the same rule (strtoll; 16 or 64, else 32), so both sides agree on the ring layout.
++ * Record layouts (64-bit little-endian words; the word holding the phase bit is written last):
++ *   32 B (LOCKED): w0 cb_fn, w1 cb_arg, w2 cpl bytes [0:8), w3 cpl bytes [8:16) with the ring
++ *        phase at bit 48. 2 records per 64 B line.
++ *   16 B: w0 cb_arg, w1 cpl bytes [8:16) with the ring phase at bit 48 (sqhd[15:0],
++ *        sqid[31:16], cid[47:32], status[63:49]). Dropped: cb_fn (the host registers one per
++ *        qpair) and cpl bytes [0:8) (cdw0 + reserved; this target always sends 0, and a Mode D
++ *        read uses neither). 4 records per 64 B line.
++ *   64 B: the 32 B record in w0..w3; w4..w7 are padding, never written. 1 record per line.
++ */
++/* Read IAU_INV_REC_BYTES once (call at transport create, before any SQ attaches). When the env is
++ * non-empty, prints "INV_REC target: env=<value> bytes=<B> per_line=<K>" to stderr (stable:
++ * scripts/realcore/inv/check_l.py checks it against the host's INV_REC lines). iau_flush() keeps
++ * the original 32 B loop and branches out of line for 16/64 B. */
++void iau_inv_rec_init(void);
++uint32_t iau_inv_rec_bytes(void);	/* inv 23: IAU_INV_REC_BYTES = 16|32|64, default 32 */
++
+ #endif

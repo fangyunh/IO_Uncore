@@ -1,0 +1,100 @@
+# inv-patch: 24-l4-idleflush
+# purpose: L4 oracle, adaptive completion flush (spec I4 L4, H9): with IAU_INV_IDLE_FLUSH=1 nvmf_tgt publishes a queue's staged Mode D completion records at once when nothing is left in flight on the device for that SQ (the SQ's fast-path in-flight count fp->n is 0 and staged > 0), instead of waiting for IAU_CQ_BATCH_N records or IAU_CQ_BATCH_T_NS. Checked in nvmf_vfio_user_sq_poll right after fp_drain_due, before the unchanged time-based iau_sq_poll_timer. It only calls the existing iau_flush(), so every record size (16/32/64 from 23) and the BATCH_N/BATCH_T flushes keep working, no record is emitted twice or lost (flush empties the staging and resets staged) and credits are released by the flush exactly as for the other two triggers. New counter struct iau_sq.flush_by_idle (absorbed by IAU_SQ_ALIGN padding) and ' flush_idle=N' on the IAU_STATS line. Read once at transport create by iau_inv_idle_init() (strtoll != 0 enables); one INV_IDLE target: env=V enabled=0|1 line on stderr when the env is set. Limit: at low QD with staggered per-channel completions only the tail of a burst is accelerated (early completions still wait for the last in-flight IO or the T timer), so a null result must be read with that limit. Evidence: IAU_STATS (with flush_idle=N) is printed at SQ destroy, so read it from the destroy-time line in the target log. Lever off: one load of a global bool on the poll path, iau_flush and the stage path are untouched
+# safety: SAFE (policy change, device side only)
+# breaks: none (policy change, device side only); the host sees the same records earlier; oracle overhead the design would not pay: none beyond one flag load and one compare of the in-flight count per poll
+# env: IAU_INV_IDLE_FLUSH=1 (nvmf_tgt; default off)
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff,12-residue.diff,13-iport.diff,20-l1-trfree.diff,22-l2-thin.diff,23-l3-rec.diff
+diff -ruN a/lib/nvmf/vfio_user.c b/lib/nvmf/vfio_user.c
+--- a/lib/nvmf/vfio_user.c	2026-10-14 01:37:13.249836640 +0000
++++ b/lib/nvmf/vfio_user.c	2026-10-14 01:44:40.895112665 +0000
+@@ -1219,6 +1219,7 @@
+ 		vu_transport->pg_by_qid = (pg_env != NULL && pg_env[0] != '\0' && pg_env[0] != '0');
+ 	}
+ 	iau_inv_rec_init();	/* inv 23-l3-rec: IAU_INV_REC_BYTES, read once at target init */
++	iau_inv_idle_init();	/* inv 24-l4-idleflush: IAU_INV_IDLE_FLUSH, read once at target init */
+ 
+ 	if (opts->transport_specific != NULL &&
+ 	    spdk_json_decode_object_relaxed(opts->transport_specific, vfio_user_transport_opts_decoder,
+@@ -1800,8 +1801,9 @@
+ 	if (flush) {
+ 		iau_flush(&ctrlr->iau, sq->qid);
+ 		SPDK_NOTICELOG("IAU_STATS qid=%u fetched=%" PRIu64 " emitted=%" PRIu64
+-			       " flush_n=%" PRIu64 " flush_t=%" PRIu64 " credits_in_use=%u\n",
+-			       sq->qid, is->fetched, is->emitted, is->flush_by_n, is->flush_by_t,
++			       " flush_n=%" PRIu64 " flush_t=%" PRIu64 " flush_idle=%" PRIu64
++			       " credits_in_use=%u\n",
++			       sq->qid, is->fetched, is->emitted, is->flush_by_n, is->flush_by_t, is->flush_by_idle,
+ 			       is->credits_in_use);
+ 	}
+ 	iau_sq_detach(&ctrlr->iau, sq->qid);
+@@ -5321,6 +5323,16 @@
+ 			count += done;
+ 		}
+ 		if (sq->iau_attached) {
++			/* inv 24-l4: nothing left in flight on the device for this SQ -> no batch will
++			 * fill soon, so publish what is staged now instead of waiting for BATCH_T. */
++			if (iau_inv_idle_flush() && sq->fp->n == 0) {
++				struct iau_sq *isq = &sq->ctrlr->iau.sq[sq->qid];
++
++				if (isq->staged > 0) {
++					isq->flush_by_idle++;
++					iau_flush(&sq->ctrlr->iau, sq->qid);
++				}
++			}
+ 			/* Time-based flush; runs on every poll, including empty ones. */
+ 			iau_sq_poll_timer(&sq->ctrlr->iau, sq->qid, spdk_get_ticks());
+ 		}
+diff -ruN a/lib/nvmf/vfio_user_iau.c b/lib/nvmf/vfio_user_iau.c
+--- a/lib/nvmf/vfio_user_iau.c	2026-10-14 01:37:13.250338124 +0000
++++ b/lib/nvmf/vfio_user_iau.c	2026-10-14 01:37:31.307925465 +0000
+@@ -180,6 +180,23 @@
+ 		(v == 16 || v == 32 || v == 64) ? "" : " (value not 16|32|64: LOCKED 32 B kept)");
+ }
+ 
++/* inv 24-l4-idleflush: set once at transport create, read-only afterwards (unit tests: false). */
++bool g_iau_inv_idle_flush;
++
++void
++iau_inv_idle_init(void)
++{
++	const char *e = getenv("IAU_INV_IDLE_FLUSH");
++
++	g_iau_inv_idle_flush = false;
++	if (e == NULL || e[0] == '\0') {
++		return;		/* unset: stock behaviour, no output */
++	}
++	g_iau_inv_idle_flush = strtoll(e, NULL, 10) != 0;
++	/* Stable format for the campaign logs (no qid=). */
++	fprintf(stderr, "INV_IDLE target: env=%s enabled=%d\n", e, g_iau_inv_idle_flush ? 1 : 0);
++}
++
+ uint32_t
+ iau_inv_rec_bytes(void)
+ {
+diff -ruN a/lib/nvmf/vfio_user_iau.h b/lib/nvmf/vfio_user_iau.h
+--- a/lib/nvmf/vfio_user_iau.h	2026-10-14 01:37:13.250461196 +0000
++++ b/lib/nvmf/vfio_user_iau.h	2026-10-14 01:37:31.307824062 +0000
+@@ -63,6 +63,7 @@
+ 	uint64_t			emitted;
+ 	uint64_t			flush_by_n;
+ 	uint64_t			flush_by_t;
++	uint64_t			flush_by_idle;	/* inv 24-l4: flushes taken because nothing was in flight */
+ };
+ SPDK_STATIC_ASSERT(sizeof(struct iau_sq) % IAU_SQ_ALIGN == 0, "iau_sq must be a multiple of IAU_SQ_ALIGN");
+ 
+@@ -126,6 +127,15 @@
+  * non-empty, prints "INV_REC target: env=<value> bytes=<B> per_line=<K>" to stderr (stable:
+  * scripts/realcore/inv/check_l.py checks it against the host's INV_REC lines). iau_flush() keeps
+  * the original 32 B loop and branches out of line for 16/64 B. */
++/* inv 24-l4-idleflush: IAU_INV_IDLE_FLUSH=1 (any value whose strtoll is nonzero), read once at
++ * transport create by iau_inv_idle_init(); a plain flag read on the poll path. */
++extern bool g_iau_inv_idle_flush;
++void iau_inv_idle_init(void);
++static inline bool
++iau_inv_idle_flush(void)
++{
++	return g_iau_inv_idle_flush;
++}
+ void iau_inv_rec_init(void);
+ uint32_t iau_inv_rec_bytes(void);	/* inv 23: IAU_INV_REC_BYTES = 16|32|64, default 32 */
+ 

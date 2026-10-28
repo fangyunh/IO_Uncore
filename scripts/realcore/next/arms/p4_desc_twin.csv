@@ -1,0 +1,9 @@
+arm_id,variant,tgt_variant,mode,env,trace
+I1e,nx-p4a,,5,,
+I1et,nx-p4a,,5,IAU_DEV_TMAX=500000,
+I1v6,nx-p4a,,6,,
+I1v6t,nx-p4a,,6,IAU_DEV_TMAX=500000,
+I1v6n48,nx-p4a,,6,SPDK_IAU_DESC_STRIDE=48,
+I1v6n48t,nx-p4a,,6,SPDK_IAU_DESC_STRIDE=48;IAU_DEV_TMAX=500000,
+I1,nx-p4a,,4,,
+I1t,nx-p4a,,4,IAU_DEV_TMAX=500000,

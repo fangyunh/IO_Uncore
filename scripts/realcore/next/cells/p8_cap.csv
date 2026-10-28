@@ -1,0 +1,6 @@
+cell_id,app_cpus,dev_cpus,qd,qpairs,controllers,compute,lat,placement,env,workload,rwmix,io_size,engine_cpus
+c3nzc0,0,4,16,1,4,0,1,same-socket,IAU_DEV_CHANNELS=64;IAU_DEV_MODEL=ctrlr,randread,100,4096,20
+c3nzc2,0,4,16,1,4,2,1,same-socket,IAU_DEV_CHANNELS=64;IAU_DEV_MODEL=ctrlr,randread,100,4096,20
+c3nzc4,0,4,16,1,4,4,1,same-socket,IAU_DEV_CHANNELS=64;IAU_DEV_MODEL=ctrlr,randread,100,4096,20
+c3nzc8,0,4,16,1,4,8,1,same-socket,IAU_DEV_CHANNELS=64;IAU_DEV_MODEL=ctrlr,randread,100,4096,20
+c3nzc16,0,4,16,1,4,16,1,same-socket,IAU_DEV_CHANNELS=64;IAU_DEV_MODEL=ctrlr,randread,100,4096,20

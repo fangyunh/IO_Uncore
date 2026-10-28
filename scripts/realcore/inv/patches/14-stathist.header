@@ -1,0 +1,6 @@
+# inv-patch: 14-stathist
+# purpose: B-stock layout: lean spdk_nvme_pcie_stat equals upstream (fork-only completion_calls/_hist compiled out)
+# safety: SAFE
+# breaks: none (lean only drops two instrumentation counters from --transport-stats)
+# env: none
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff,12-residue.diff,13-iport.diff

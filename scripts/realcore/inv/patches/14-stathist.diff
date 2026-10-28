@@ -1,0 +1,58 @@
+# inv-patch: 14-stathist
+# purpose: B-stock layout: lean spdk_nvme_pcie_stat equals upstream (fork-only completion_calls/_hist compiled out)
+# safety: SAFE
+# breaks: none (lean only drops two instrumentation counters from --transport-stats)
+# env: none
+# base: 00-spin.diff,01-floor.diff,10-walk.diff,11-deadstores.diff,12-residue.diff,13-iport.diff
+diff -ruN a/app/spdk_nvme_perf/perf.c b/app/spdk_nvme_perf/perf.c
+--- a/app/spdk_nvme_perf/perf.c	2026-10-14 04:03:12.849092706 +0000
++++ b/app/spdk_nvme_perf/perf.c	2026-10-14 04:03:27.062979611 +0000
+@@ -1284,7 +1284,9 @@
+ nvme_dump_pcie_statistics(struct spdk_nvme_transport_poll_group_stat *stat)
+ {
+ 	struct spdk_nvme_pcie_stat *pcie_stat;
++#ifndef SPDK_NVME_IO_CYCLE_OFF
+ 	uint32_t i;
++#endif
+ 
+ 	pcie_stat = &stat->pcie;
+ 
+@@ -1292,13 +1294,16 @@
+ 	printf("\tpolls:               %"PRIu64"\n", pcie_stat->polls);
+ 	printf("\tidle_polls:          %"PRIu64"\n", pcie_stat->idle_polls);
+ 	printf("\tcompletions:         %"PRIu64"\n", pcie_stat->completions);
++#ifndef SPDK_NVME_IO_CYCLE_OFF
+ 	printf("\tcompletion_calls:    %"PRIu64"\n", pcie_stat->completion_calls);
++#endif
+ 	printf("\tcq_mmio_doorbell_updates: %"PRIu64"\n", pcie_stat->cq_mmio_doorbell_updates);
+ 	printf("\tcq_shadow_doorbell_updates: %"PRIu64"\n", pcie_stat->cq_shadow_doorbell_updates);
+ 	printf("\tsubmitted_requests:  %"PRIu64"\n", pcie_stat->submitted_requests);
+ 	printf("\tsq_mmio_doorbell_updates:  %"PRIu64"\n", pcie_stat->sq_mmio_doorbell_updates);
+ 	printf("\tsq_shadow_doorbell_updates:  %"PRIu64"\n", pcie_stat->sq_shadow_doorbell_updates);
+ 	printf("\tqueued_requests:     %"PRIu64"\n", pcie_stat->queued_requests);
++#ifndef SPDK_NVME_IO_CYCLE_OFF
+ 	printf("\tcompletions_per_poll_hist: ");
+ 	for (i = 0; i < 33; i++) {
+ 		if (i == 32) {
+@@ -1311,6 +1316,7 @@
+ 		}
+ 	}
+ 	printf("\n");
++#endif
+ 	printf("\tpcie_stats: polls=%"PRIu64" completions=%"PRIu64" sq_mmio=%"PRIu64" cq_mmio=%"PRIu64"\n",
+ 	       pcie_stat->polls, pcie_stat->completions,
+ 	       pcie_stat->sq_mmio_doorbell_updates, pcie_stat->cq_mmio_doorbell_updates);
+diff -ruN a/include/spdk/nvme.h b/include/spdk/nvme.h
+--- a/include/spdk/nvme.h	2026-10-14 04:03:12.795206944 +0000
++++ b/include/spdk/nvme.h	2026-10-14 04:03:22.123985619 +0000
+@@ -581,8 +581,10 @@
+ 	uint64_t polls;
+ 	uint64_t idle_polls;
+ 	uint64_t completions;
++#ifndef SPDK_NVME_IO_CYCLE_OFF
+ 	uint64_t completion_calls;
+ 	uint64_t completion_calls_hist[33];
++#endif
+ 	uint64_t cq_mmio_doorbell_updates;
+ 	uint64_t cq_shadow_doorbell_updates;
+ 	uint64_t submitted_requests;

@@ -1,0 +1,2 @@
+cell_id,app_cpus,dev_cpus,qd,qpairs,controllers,compute,lat,placement,env,workload,rwmix,io_size,engine_cpus
+nzfo16q16,0,2+3+4+5,16,1,16,0,1,same-socket,IAU_DEV_CHANNELS=64;IAU_DEV_MODEL=ctrlr,randread,100,4096,6+7

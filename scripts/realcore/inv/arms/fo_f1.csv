@@ -1,0 +1,9 @@
+arm_id,variant,tgt_variant,mode,env,trace
+ref-m0,inv-stock,,0,,
+ref-m4,inv-stock,,4,,
+pub-m0,inv-fo-ref,,0,,
+pub-m4,inv-fo-ref,,4,,
+lean-m0,lean,,0,,
+lean-m4,lean,,4,,
+fast-m0,lean,,0,SPDK_PERF_TRACE_FAST=1,
+fast-m4,lean,,4,SPDK_PERF_TRACE_FAST=1,

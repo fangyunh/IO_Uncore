@@ -1,0 +1,7 @@
+cell_id,app_cpus,dev_cpus,qd,qpairs,controllers,compute,lat,placement,env,workload,rwmix,io_size,engine_cpus
+c3nzk1,0,8,16,1,4,2,1,cross-socket,IAU_DEV_CHANNELS=64;IAU_DEV_MODEL=ctrlr,randread,100,4096,4
+c3nzk2,0+1,8+9,16,1,8,2,1,cross-socket,IAU_DEV_CHANNELS=64;IAU_DEV_MODEL=ctrlr,randread,100,4096,4+5
+c3nzk4,0+1+2+3,8+9+10+11,16,1,16,2,1,cross-socket,IAU_DEV_CHANNELS=64;IAU_DEV_MODEL=ctrlr,randread,100,4096,4+5+6+7
+c3g5k1,0,8,176,1,4,2,1,cross-socket,IAU_DEV_MODEL=ctrlr;IAU_DEV_CHANNELS=8;IAU_DEV_TMAX=308750;IAU_DEV_LMIN_NS=50000,randread,100,4096,4
+c3g5k2,0+1,8+9,176,1,8,2,1,cross-socket,IAU_DEV_MODEL=ctrlr;IAU_DEV_CHANNELS=8;IAU_DEV_TMAX=308750;IAU_DEV_LMIN_NS=50000,randread,100,4096,4+5
+c3g5k4,0+1+2+3,8+9+10+11,176,1,16,2,1,cross-socket,IAU_DEV_MODEL=ctrlr;IAU_DEV_CHANNELS=8;IAU_DEV_TMAX=308750;IAU_DEV_LMIN_NS=50000,randread,100,4096,4+5+6+7

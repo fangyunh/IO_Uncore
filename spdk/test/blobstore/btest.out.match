@@ -1,0 +1,156 @@
+
+SCRIPT NOW PROCESSING: -i
+Init blobstore using bdev Name: Malloc0
+blobstore init'd: ($(XX))
+
+SCRIPT NOW PROCESSING: -l bdevs
+
+List bdevs:
+	bdev Name: Malloc0
+	bdev Product Name: Malloc disk
+
+
+SCRIPT NOW PROCESSING: -n 1
+New blob id $(XX)
+blob now has USED clusters of 1
+
+SCRIPT NOW PROCESSING: -p $B0
+Super Blob ID has been set.
+
+SCRIPT NOW PROCESSING: -n 1
+New blob id $(XX)
+blob now has USED clusters of 1
+
+SCRIPT NOW PROCESSING: -m $B1 test.pattern
+Working...............................................................................................................................................................................................................................................................
+Blob import complete (from test.pattern).
+
+SCRIPT NOW PROCESSING: -d $B1 test.pattern.blob
+Working................................................................................................................................................................................................................................................................
+File write complete (to test.pattern.blob).
+
+SCRIPT NOW PROCESSING: -x $B1 key val
+Xattr has been set.
+
+SCRIPT NOW PROCESSING: -s bs
+Blobstore Public Info:
+	Using bdev Product Name: Malloc disk
+	API Version: $(N)
+	super blob ID: $(XX)
+	md page size: $(N)
+	io unit size: $(N)
+	cluster size: 1048576
+	# free clusters: $(N)
+	blobstore type:
+00000000  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   ................
+
+Blobstore Private Info:
+	Metadata start (pages): $(N)
+	Metadata length (pages): $(N)
+
+SCRIPT NOW PROCESSING: -s $B1
+Blob Public Info:
+blob ID: $(XX)
+# of clusters: 1
+# of bytes: 1048576
+# of io units: $(N)
+# of xattrs: 1
+xattrs:
+
+(0) Name:key
+(0) Value:
+
+00000000  76 61 6c                                           val
+
+Blob Private Info:
+state: CLEAN
+open ref count: 1
+
+SCRIPT NOW PROCESSING: -r $B1 key
+Xattr has been removed.
+
+SCRIPT NOW PROCESSING: -s bs
+Blobstore Public Info:
+	Using bdev Product Name: Malloc disk
+	API Version: 3
+	super blob ID: $(XX)
+	md page size: $(N)
+	io unit size: $(N)
+	cluster size: 1048576
+	# free clusters: $(N)
+	blobstore type:
+00000000  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   ................
+
+Blobstore Private Info:
+	Metadata start (pages): $(N)
+	Metadata length (pages): $(N)
+
+SCRIPT NOW PROCESSING: -D
+Init blobstore using bdev Name: Malloc0
+Signature: "SPDKBLOB" (OK)
+Version: $(N)
+CRC: $(XX) (OK)
+Blobstore Type: $(W)
+Cluster Size: 1048576
+Super Blob ID: $(XX)
+Clean: 1
+Used Metadata Page Mask Start: $(N)
+Used Metadata Page Mask Length: $(N)
+Used Cluster Mask Start: $(N)
+Used Cluster Mask Length: $(N)
+Used Blob ID Mask Start: $(N)
+Used Blob ID Mask Length: $(N)
+Metadata Start: $(N)
+Metadata Length: $(N)
+=========
+Metadata Page Index: 0 (0x0)
+Start LBA: $(N)
+Blob ID: $(XX)
+Sequence: 0
+Next: None
+In used bit array: md blob
+CRC: $(XX) (OK)
+Flags:
+	invalid: 0x0000000000000004
+		 0x0000000000000004 SPDK_BLOB_EXTENT_TABLE
+	data_ro: 0x0000000000000000
+	  md_ro: 0x0000000000000000
+		 0x0000000000000000 BLOB_CLEAR_WITH_DEFAULT (mask 0x3 value 0x0)
+Extent table:
+	Extent page:     1 length   1 at LBA $(N)
+=========
+Metadata Page Index: 1 (0x1)
+Start LBA: $(N)
+Blob ID: $(XX)
+Sequence: 0
+Next: None
+In used bit array: md
+CRC: $(XX) (OK)
+Allocated Extent - Start: 1
+=========
+Metadata Page Index: 2 (0x2)
+Start LBA: $(N)
+Blob ID: $(XX)
+Sequence: 0
+Next: None
+In used bit array: md blob
+CRC: $(XX) (OK)
+Flags:
+	invalid: 0x0000000000000004
+		 0x0000000000000004 SPDK_BLOB_EXTENT_TABLE
+	data_ro: 0x0000000000000000
+	  md_ro: 0x0000000000000000
+		 0x0000000000000000 BLOB_CLEAR_WITH_DEFAULT (mask 0x3 value 0x0)
+Extent table:
+	Extent page:     3 length   1 at LBA $(N)
+=========
+Metadata Page Index: 3 (0x3)
+Start LBA: $(N)
+Blob ID: $(XX)
+Sequence: 0
+Next: None
+In used bit array: md
+CRC: $(XX) (OK)
+Allocated Extent - Start: 2
+
+SCRIPT NOW PROCESSING: -X

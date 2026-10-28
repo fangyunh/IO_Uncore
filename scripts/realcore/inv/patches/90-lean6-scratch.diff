@@ -1,0 +1,184 @@
+# inv-patch: 90-lean6-scratch
+# purpose: reproduce the 2026-10-13 scratch lean6 result for the I0 gate
+# safety: UNSAFE
+# breaks: removes outstanding_tr on IO qpairs in both modes (abort/teardown of in-flight IO); scratch reproduction only
+# env: none
+# base: 00-spin.diff,01-floor.diff
+diff -ruN a/lib/nvme/nvme_pcie_common.c b/lib/nvme/nvme_pcie_common.c
+--- a/lib/nvme/nvme_pcie_common.c	2026-10-13 21:20:39.436426448 +0000
++++ b/lib/nvme/nvme_pcie_common.c	2026-10-13 21:20:44.238578914 +0000
+@@ -49,6 +49,7 @@
+ static inline void
+ nvme_pcie_qpair_mark_doorbell_time(struct nvme_pcie_qpair *pqpair, uint64_t t_db)
+ {
++#ifndef SPDK_NVME_IO_CYCLE_OFF
+ 	struct nvme_tracker *tr;
+ 
+ 	TAILQ_FOREACH(tr, &pqpair->outstanding_tr, tq_list) {
+@@ -57,6 +58,9 @@
+ 			tr->req->t_poll_start = pqpair->poll_cycle_accum;
+ 		}
+ 	}
++#else
++	(void)pqpair; (void)t_db;
++#endif
+ }
+ 
+ static inline uint64_t
+@@ -1015,9 +1019,12 @@
+ 		bool hw_managed = (_pctrlr->uncore_free_cid_base != NULL &&
+ 				   qpair->id != 0);
+ 		if (!hw_managed) {
+-			TAILQ_REMOVE(&pqpair->outstanding_tr, tr, tq_list);
++			if (qpair->id == 0) {	/* lean6: see submit */
++				TAILQ_REMOVE(&pqpair->outstanding_tr, tr, tq_list);
++			}
+ 			pqpair->qpair.queue_depth--;
+ 		}
++#ifndef SPDK_NVME_IO_CYCLE_OFF	/* lean6: no dead probe stores in the lean build */
+ 		req->t_dealloc_pre_end = nvme_io_cycle_rdtsc();
+ 
+ 		if (req->t_completion == 0) {
+@@ -1027,19 +1034,24 @@
+ 		req->t_end = req->t_dealloc_pre_end;
+ 		/* Record before the callback: its resubmit reuses and resets req. */
+ 		nvme_io_cycle_record(req);
++#endif
+ 
+ 		/* Bracket the application callback (fires after t_end at line 898)
+ 		 * so app_callback_ns is cleanly separable from NVMe plumbing.  req
+ 		 * memory persists after nvme_complete_request frees it to the pool,
+ 		 * so writing t_cb_end here is safe (read later in cycle_record). */
++#ifndef SPDK_NVME_IO_CYCLE_OFF
+ 		req->t_cb_start = nvme_io_cycle_rdtsc();
++#endif
+ 		/* Only check admin requests from different processes. */
+ 		if (nvme_qpair_is_admin_queue(qpair) && req->pid != getpid()) {
+ 			nvme_pcie_qpair_insert_pending_admin_request(qpair, req, cpl);
+ 		} else {
+ 			nvme_complete_request(tr->cb_fn, tr->cb_arg, qpair, req, cpl);
+ 		}
++#ifndef SPDK_NVME_IO_CYCLE_OFF
+ 		req->t_cb_end = nvme_io_cycle_rdtsc();
++#endif
+ 
+ 		tr->req = NULL;
+ 
+@@ -1416,6 +1428,14 @@
+ 				pqpair->cq_rec_phase = !pqpair->cq_rec_phase;
+ 			}
+ 
++			/* lean5: prefetch the NEXT record's tracker, as stock SPDK does for
++			 * the next CQE. */
++			{
++				uint64_t nhi = ring_d[pqpair->cq_rec_head].cpl_hi;
++				if (((uint8_t)((nhi >> 48) & 0x1u)) == pqpair->cq_rec_phase) {
++					__builtin_prefetch(&pqpair->tr[(uint16_t)((nhi >> 32) & 0xFFFFu)]);
++				}
++			}
+ 			/* Recover the tracker by cid — standard SPDK indexing (same as the
+ 			 * normal path's &pqpair->tr[cpl->cid]); needed for the recycle. */
+ 			tr = &pqpair->tr[cid];
+@@ -1424,6 +1444,8 @@
+ 				struct nvme_request *req = tr->req;
+ 				struct spdk_nvme_cpl cpl_rec;
+ 
++				__builtin_prefetch(&req->stailq);	/* lean5: as stock SPDK */
++
+ 				/* Reconstruct the spdk_nvme_cpl from the device-decoded record
+ 				 * (an NVMe CQE is byte-identical to spdk_nvme_cpl).  w3[48] holds
+ 				 * the ring phase, harmless to the app callback (it reads sc/sct). */
+@@ -1434,6 +1456,7 @@
+ 				 * status decode — offloaded); tracker_lookup = the tr[cid] index;
+ 				 * state_dealloc = the lean recycle below; app_callback = the
+ 				 * echoed callback + req free (existing columns, apples-to-apples). */
++#ifndef SPDK_NVME_IO_CYCLE_OFF	/* lean5: no dead probe stores in the lean build */
+ 				req->t_cqe_seen = cqe_seen;
+ 				req->t_completion = cqe_seen;
+ 				req->t_cqe_valid_end = nvme_io_cycle_rdtsc();
+@@ -1443,26 +1466,26 @@
+ 					req->t_poll_cycles = pqpair->poll_cycle_accum +
+ 						poll_elapsed - req->t_poll_start;
+ 				}
+-
++#else
++				(void)cqe_seen;
++#endif
+ 
+ 				/* Lean recycle (v4.1): remove from outstanding + dec queue depth.
+ 				 * complete_tracker's status decode, retry/error branches, and cpl
+ 				 * synthesis are all offloaded/elided (device pre-decoded cpl). */
+-				TAILQ_REMOVE(&pqpair->outstanding_tr, tr, tq_list);
+ 				pqpair->qpair.queue_depth--;
++#ifndef SPDK_NVME_IO_CYCLE_OFF
+ 				req->t_dealloc_pre_end = nvme_io_cycle_rdtsc();
+ 				req->t_end = req->t_dealloc_pre_end;
+ 				nvme_io_cycle_record(req);
+-
+-				/* Fire the ECHOED application callback directly (the only real
+-				 * host work) then return the request + tracker to their pools.
+-				 * req memory persists after free until reused, so t_cb_end below
+-				 * is safe (read later by nvme_io_cycle_record). */
+ 				req->t_cb_start = nvme_io_cycle_rdtsc();
++#endif
+ 				((spdk_nvme_cmd_cb)(uintptr_t)rec_cb_fn)(
+ 					(void *)(uintptr_t)rec_cb_arg, &cpl_rec);
+ 				nvme_free_request(req);
++#ifndef SPDK_NVME_IO_CYCLE_OFF
+ 				req->t_cb_end = nvme_io_cycle_rdtsc();
++#endif
+ 
+ 				tr->req = NULL;
+ 				TAILQ_INSERT_HEAD(&pqpair->free_tr, tr, tq_list);
+@@ -1587,10 +1610,17 @@
+ 			pqpair->flags.phase = !pqpair->flags.phase;
+ 		}
+ 
++#ifdef SPDK_NVME_IO_CYCLE_OFF	/* lean6: no dead probe stores in the lean build */
++		tr = &pqpair->tr[cpl->cid];
++		pqpair->sq_head = cpl->sqhd;
++		if (0) {
++			uint64_t cqe_seen = 0;
++#else
+ 		uint64_t cqe_seen = nvme_io_cycle_rdtsc();
+ 		tr = &pqpair->tr[cpl->cid];
+ 		pqpair->sq_head = cpl->sqhd;
+ 		if (tr->req) {
++#endif
+ 			tr->req->t_cqe_seen = cqe_seen;
+ 			tr->req->t_completion = cqe_seen;
+ 			tr->req->t_cqe_valid_end = nvme_io_cycle_rdtsc();
+@@ -2349,6 +2379,12 @@
+ 	bool			sgl_supported;
+ 	bool			mptr_sgl_supported;
+ 	bool			dword_aligned = true;
++	/* lean3 experiment: Mode-D IOs skip the outstanding_tr list (the device owns
++	 * the outstanding set); same predicate as the Mode-D submit branch below. */
++	const bool		mode_d_io = uncore_mode_d() && pqpair->sq_desc_ring != NULL &&
++					    qpair->id != 0 && req->payload_size <= 131072u &&
++					    (req->cmd.opc == SPDK_NVME_OPC_READ ||
++					     req->cmd.opc == SPDK_NVME_OPC_WRITE);
+ 
+ 	if (spdk_unlikely(nvme_qpair_is_admin_queue(qpair))) {
+ 		nvme_ctrlr_lock(ctrlr);
+@@ -2423,7 +2459,10 @@
+ 			}
+ 			pqpair->stat->submitted_requests++;
+ 			TAILQ_REMOVE(&pqpair->free_tr, tr, tq_list);
+-			TAILQ_INSERT_TAIL(&pqpair->outstanding_tr, tr, tq_list);
++			if (qpair->id == 0) {	/* lean6: no outstanding list on IO qpairs (any mode) */
++				TAILQ_INSERT_TAIL(&pqpair->outstanding_tr, tr, tq_list);
++			}
++			(void)mode_d_io;
+ 			pqpair->qpair.queue_depth++;
+ 			tr->req = req;
+ 			tr->cb_fn = req->cb_fn;
+@@ -2486,7 +2525,7 @@
+ 		req->t_db_end    = req->t_cmd_end;
+ 		req->t_poll_start = pqpair->poll_cycle_accum;
+ 
+-		pqpair->sq_desc_tail = (uint32_t)((_idx + 1) % pqpair->num_entries);
++		pqpair->sq_desc_tail = (_idx + 1 == pqpair->num_entries) ? 0 : _idx + 1;
+ 		if (!pqpair->flags.delay_cmd_submit) {
+ 			nvme_pcie_qpair_ring_sq_doorbell(qpair);
+ 			pqpair->last_sq_desc_tail = pqpair->sq_desc_tail;
